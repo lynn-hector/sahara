@@ -47,7 +47,7 @@
 
 ### 1.1 最终交付物
 
-Sahara 最终交付**五个独立可部署服务** + **一套基础设施**：
+Sahara 最终交付**三个独立可部署服务** + **一个伴生进程** + **一套基础设施**：
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -59,19 +59,28 @@ Sahara 最终交付**五个独立可部署服务** + **一套基础设施**：
 │  │ ① sahara-gw      │  │ ② sahara-api     │  │ ③ sahara-rt      │   │
 │  │    Go Gateway     │  │    Go API Service │  │    Python Runtime │   │
 │  │    WS 实时通信    │  │    RESTful HTTP   │  │    Agent 执行引擎 │   │
-│  │    Docker 镜像    │  │    Docker 镜像    │  │    Docker 镜像    │   │
+│  │    事件消费+聚合  │  │    用户/会话 CRUD │  │    事件发射       │   │
+│  │    Pipeline 处理  │  │    Docker 镜像    │  │    Docker 镜像    │   │
+│  │    Docker 镜像    │  │                   │  │                   │   │
 │  └──────────────────┘  └──────────────────┘  └──────────────────┘   │
-│  ┌──────────────────┐  ┌──────────────────┐                         │
-│  │ ④ sahara-eb      │  │ ⑤ sahara-sb      │                         │
-│  │    Event Bus      │  │    Sandbox Pool   │                         │
-│  │    (Redis Streams)│  │    (容器池管理)   │                         │
-│  └──────────────────┘  └──────────────────┘                         │
+│  ┌──────────────────┐                                                │
+│  │ ④ sahara-sb      │  ← 伴生进程 (与 Runtime 同机部署)             │
+│  │    Sandbox Pool   │                                                │
+│  │    (容器池管理)   │                                                │
+│  └──────────────────┘                                                │
 │                                                                      │
 │  基础设施                                                            │
 │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐   │
 │  │ Redis (7.x)      │  │ PostgreSQL (16)  │  │ Docker Engine    │   │
-│  │ 会话/路由/锁/MQ  │  │ 持久化/审计      │  │ 沙箱容器运行时   │   │
+│  │ 会话/路由/锁     │  │ 持久化/审计      │  │ 沙箱容器运行时   │   │
+│  │ ★ Redis Streams  │  │                   │  │ gVisor (runsc)   │   │
+│  │   (事件传输)     │  │                   │  │                   │   │
 │  └──────────────────┘  └──────────────────┘  └──────────────────┘   │
+│                                                                      │
+│  注意: 没有独立的"Event Bus"服务。                                   │
+│  事件传输通过 Redis Streams 实现: Runtime XADD → Gateway XREAD。    │
+│  聚合(150ms)、Pipeline 处理器等逻辑在 Gateway 内完成。              │
+│  详见: EVENT-BUS-DESIGN.md (异步事件传输协议)                        │
 │                                                                      │
 │  工程产出                                                            │
 │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐   │
@@ -89,7 +98,7 @@ Sahara 最终交付**五个独立可部署服务** + **一套基础设施**：
 | 移动端 App (iOS/Android) | Phase 1 聚焦后端服务；客户端通过 WS/HTTP 对接 |
 | 完整渠道集成 (Telegram/Discord/Slack 等) | Phase 2 逐步接入；Phase 1 只提供 WS + HTTP API |
 | LLM Provider 全量接入 | Runtime 先支持 OpenAI + Anthropic，其他后续迭代 |
-| 自研 Rust Event Bus | Phase 3 根据瓶颈决定是否引入 |
+| NATS JetStream / 自研 Event Bus | Phase 3 根据 Redis Streams 瓶颈度量决定；接口已抽象 |
 | 管理后台 (Admin Panel) | Phase 2+ 根据运营需求单独规划 |
 
 ---
@@ -153,14 +162,20 @@ sahara/
 ├── runtime/                      # Python Runtime 服务 (sahara-rt)
 │   ├── sahara_runtime/           # 主包
 │   │   ├── __init__.py
-│   │   ├── server.py             # gRPC server 入口
-│   │   ├── agent_loop.py         # LLM 交互循环
-│   │   ├── tools/                # 工具系统
-│   │   ├── sandbox/              # 沙箱管理
-│   │   ├── session/              # 会话存储
-│   │   ├── events/               # 事件发射
-│   │   ├── context/              # 上下文管理
-│   │   └── prompt/               # 系统提示词
+│   │   ├── server.py             # gRPC server 入口 (D4 §3)
+│   │   ├── agent_loop.py         # Agent Loop 核心状态机 (D4 §4)
+│   │   ├── events/               # EventEmitter → Redis Streams (D4 §5)
+│   │   ├── model_router/         # Model Router + Provider Adapter + Fallback (D4 §6)
+│   │   ├── tools/                # ToolRegistry + ToolPolicy + ToolExecutor (D4 §7)
+│   │   ├── prompt/               # System Prompt Builder + PromptSegment (D4 §8)
+│   │   ├── sandbox/              # Sandbox Manager + 容器池 (D4 §9)
+│   │   ├── skills/               # SkillLoader + SkillFilter (D4 §10)
+│   │   ├── context/              # Context Manager 四层防御 (D4 §11)
+│   │   ├── memory/               # Agent Memory 三层记忆 (D4 §12)
+│   │   ├── hooks/                # Hook System 生命周期钩子 (D4 §13)
+│   │   ├── di/                   # Dependencies 注入容器 (D4 §14)
+│   │   ├── config/               # 配置管理 (D4 §17)
+│   │   └── errors/               # 错误分类与弹性 (D4 §16)
 │   ├── gen/                      # Proto 生成的 Python 代码
 │   ├── tests/
 │   ├── pyproject.toml            # 依赖管理 (uv)
@@ -222,93 +237,44 @@ gateway/   runtime/
 gen/       gen/
 ```
 
-### 3.2 核心 Proto 定义 (初版)
+### 3.2 核心 Proto 定义
 
-```protobuf
-// proto/sahara/runtime/v1/runtime.proto
+> **权威来源**：Proto 定义的完整版本在 [gRPC 协议设计 (D1)](./GRPC-PROTOCOL-DESIGN.md) 中维护。以下为概览摘要。
 
-syntax = "proto3";
-package sahara.runtime.v1;
+**Service 定义**：
 
-// Gateway → Runtime: 提交 Agent 任务
-service AgentRuntimeService {
-  // 提交任务，返回 accepted/rejected
-  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
-  // 中止正在执行的任务
-  rpc AbortTask(AbortTaskRequest) returns (AbortTaskResponse);
-  // 健康检查 + 负载上报
-  rpc ReportStatus(StatusRequest) returns (StatusResponse);
-}
+```text
+AgentService (sahara.agent.v1) — 核心业务
+├── SubmitTask       提交 Agent 任务          Phase 1
+├── AbortTask        中止执行中的任务          Phase 1
+├── SendInput        人机交互输入投递          Phase 2
+├── GetTaskStatus    查询单个任务状态          Phase 1
+└── ListActiveTasks  列出所有活跃任务          Phase 2
 
-message SubmitTaskRequest {
-  string task_id = 1;          // 全局唯一任务 ID
-  string session_key = 2;      // 会话标识
-  string agent_id = 3;         // Agent 配置标识
-  string user_message = 4;     // 用户消息
-  string idempotency_key = 5;  // 幂等键
-  map<string, string> metadata = 6; // 附加信息 (渠道、用户属性等)
-}
-
-message SubmitTaskResponse {
-  enum Status {
-    ACCEPTED = 0;
-    REJECTED_BUSY = 1;
-    REJECTED_INVALID = 2;
-  }
-  Status status = 1;
-  string task_id = 2;
-  string run_id = 3;           // Runtime 分配的执行 ID
-}
-
-message AbortTaskRequest {
-  string task_id = 1;
-  string run_id = 2;
-}
-
-message AbortTaskResponse {
-  bool success = 1;
-}
-
-message StatusRequest {}
-
-message StatusResponse {
-  int32 active_tasks = 1;      // 当前执行中的任务数
-  int32 max_tasks = 2;         // 最大并发任务数
-  float cpu_usage = 3;
-  float memory_usage = 4;
-}
+WorkerService (sahara.worker.v1) — 运维管理
+├── Heartbeat        心跳 + 负载上报          Phase 1
+├── DrainWorker      优雅下线                  Phase 2
+└── GetWorkerInfo    查询 Worker 详情          Phase 2
 ```
 
-```protobuf
-// proto/sahara/event/v1/event.proto
+**事件类型 (12 种)**：
 
-syntax = "proto3";
-package sahara.event.v1;
-
-// 事件结构 (用于 Redis Streams 传输，序列化为 protobuf bytes)
-message AgentEvent {
-  string event_id = 1;
-  string run_id = 2;
-  string session_key = 3;
-  string task_id = 4;
-  EventType type = 5;
-  bytes payload = 6;           // JSON 编码的事件数据
-  int64 timestamp_ms = 7;
-  int32 seq = 8;               // 会话内序列号
-
-  enum EventType {
-    DELTA = 0;                 // LLM 流式文本片段
-    TOOL_START = 1;            // 工具开始执行
-    TOOL_RESULT = 2;           // 工具执行结果
-    RUN_START = 3;             // Agent 运行开始
-    RUN_COMPLETE = 4;          // Agent 运行完成
-    RUN_ERROR = 5;             // Agent 运行出错
-    RUN_ABORT = 6;             // Agent 运行被中止
-    THINKING = 7;              // 模型思考中
-    USAGE = 8;                 // Token 用量统计
-  }
-}
+```text
+EventType 枚举:
+  DELTA(0) / TOOL_START(1) / TOOL_RESULT(2)         — 执行过程
+  RUN_START(3) / RUN_COMPLETE(4) / RUN_ERROR(5)      — 生命周期
+  RUN_ABORT(6) / THINKING(7) / USAGE(8)              — 辅助信息
+  INPUT_REQUIRED(10) / TOOL_CONFIRM_REQUIRED(11)     — 人机交互 (Phase 2)
+  MODEL_FALLBACK(12)                                  — 模型降级通知 (Phase 2)
 ```
+
+**关键新增**（相比技术方案初版）：
+- `SendInput` RPC：支持人机交互（高危工具确认、用户文本输入）
+- `TaskState.WAITING_FOR_INPUT`：任务等待用户输入的状态
+- Sticky Affinity：`SendInput` 必须路由到持有任务的 Worker
+- `InputRequiredPayload` / `ToolConfirmRequiredPayload` / `ModelFallbackPayload`：三个新事件 payload
+
+> 详细的 Proto message 定义、字段说明、错误码、超时配置等见 [GRPC-PROTOCOL-DESIGN.md](./GRPC-PROTOCOL-DESIGN.md)。
 
 ### 3.3 版本演进规则
 
@@ -406,41 +372,46 @@ func (d *Dispatcher) Submit(ctx context.Context, req *pb.SubmitTaskRequest) (*pb
 
 | # | 任务 | 详细说明 | 预估 |
 | ---- | ---- | ---- | ---- |
-| P1-6 | gRPC Server 实现 | SubmitTask / AbortTask / ReportStatus 三个 RPC | 2d |
-| P1-7 | LLM 交互循环 (agent_loop) | 直接用 Anthropic/OpenAI SDK；流式响应处理；工具调用循环 (max 20 轮) | 5d |
-| P1-8 | 事件发射到 Redis Streams | 每个 delta/tool/lifecycle 事件 → XADD 到 `events:{session_key}` stream | 2d |
-| P1-9 | Gateway 事件消费 | Redis XREADGROUP 消费事件 → 查找 session 对应的 WS 连接 → 推送 | 3d |
-| P1-10 | 150ms 限频聚合 | Gateway 侧对 delta 事件做 150ms 窗口合并后再推送给客户端 | 1d |
+| P1-6 | gRPC Server 实现 | SubmitTask / AbortTask / Heartbeat 三个 RPC；asyncio.Semaphore 并发控制 | 2d |
+| P1-7 | Agent Loop 核心 | 直接用 Anthropic/OpenAI SDK；流式响应处理；工具调用循环 (max 20 轮)；stop_reason 状态机 | 5d |
+| P1-7b | Model Router (单 Provider) | Provider Adapter 抽象；API Key 轮换；基础重试逻辑 | 2d |
+| P1-7c | System Prompt Builder | PromptSegment 动态拼装；基础段（角色/工具说明/历史）组合 | 1d |
+| P1-8 | EventEmitter → Redis Streams | 每个 delta/tool/lifecycle 事件序列化 → XADD `events:{session_key}`；seq 生成 | 2d |
+| P1-9 | Gateway 事件消费 | Redis XREAD 消费事件 → 查找 session 对应的 WS 连接 → 推送 | 3d |
+| P1-10 | 150ms 限频聚合 | Gateway 侧 Delta Aggregator：150ms 窗口合并后再推送给客户端 | 1d |
 
-**Runtime 核心结构**：
+**Runtime 核心结构**（参见 D4 §3 gRPC Server 和 §4 Agent Loop 完整设计）：
 
 ```python
-# runtime/sahara_runtime/server.py
+# runtime/sahara_runtime/server.py — 简化示意
 
-class RuntimeServicer(AgentRuntimeServiceServicer):
-    def __init__(self, config: RuntimeConfig):
-        self.semaphore = asyncio.Semaphore(config.max_concurrent_tasks)
+class AgentServicer(AgentServiceServicer):
+    def __init__(self, container: DIContainer):
+        self.container = container
+        self.semaphore = asyncio.Semaphore(container.config.max_concurrent_tasks)
         self.active_runs: dict[str, asyncio.Task] = {}
-        self.event_emitter = RedisEventEmitter(config.redis_url)
 
     async def SubmitTask(self, request, context):
         if self.semaphore.locked():
             return SubmitTaskResponse(status=Status.REJECTED_BUSY)
-
         run_id = generate_run_id()
-        task = asyncio.create_task(
-            self._execute(request, run_id)
-        )
+        task = asyncio.create_task(self._execute(request, run_id))
         self.active_runs[run_id] = task
         return SubmitTaskResponse(status=Status.ACCEPTED, run_id=run_id)
 
+    async def SendInput(self, request, context):
+        """人机交互: 接收用户输入并恢复暂停的 Agent Loop"""
+        run = self.active_runs.get(request.run_id)
+        if not run:
+            context.abort(grpc.StatusCode.NOT_FOUND, "Run not found")
+        await run.deliver_input(request.action, request.input_text)
+
     async def _execute(self, request, run_id):
         async with self.semaphore:
-            await run_agent_loop(
+            await self.container.agent_loop.run(
                 session_key=request.session_key,
                 user_message=request.user_message,
                 run_id=run_id,
-                event_emitter=self.event_emitter,
             )
 ```
 
@@ -495,8 +466,13 @@ class RuntimeServicer(AgentRuntimeServiceServicer):
 | P2-11 | 告警规则 | Gateway 5xx > 1%；Runtime 任务排队 > 50；LLM 调用失败率 > 5% | 1d |
 | P2-12 | K8s 部署清单 | HPA 配置；PDB 配置；资源限制；ConfigMap/Secret 管理 | 3d |
 | P2-13 | 过载降级 | 所有 Worker 忙 → gRPC 返回 UNAVAILABLE → Gateway 返回"排队中"+ 预估等待 | 2d |
-| P2-14 | 模型降级策略 | 主模型限流 → 自动切换备用模型 (如 Claude → GPT-4o-mini) | 2d |
-| P2-15 | 用户注册与管理 | 基础用户系统：注册/登录/API Key 管理；用量配额 | 3d |
+| P2-14 | Model Router 多 Provider + Fallback | 四层 Fallback 防御 (重试→Key轮换→上下文压缩→模型降级链)；FallbackRunner | 4d |
+| P2-15 | 人机交互 (SendInput) | gRPC SendInput RPC；Gateway agent.input WS 方法；Sticky Affinity 路由；WAITING_FOR_INPUT 状态 | 4d |
+| P2-16 | Hook 系统 | 12 个生命周期钩子点 + HookRunner + 优先级执行 + 错误隔离 | 3d |
+| P2-17 | Skills 管理 | SkillTier/SkillLoader/SkillFilter；Prompt 驱动多步引导 | 2d |
+| P2-18 | Agent Memory (基础) | Working Memory + Short-term (Session Store)；Embedder 接口 | 3d |
+| P2-19 | 用户注册与管理 | 基础用户系统：注册/登录/API Key 管理；用量配额 | 3d |
+| P2-20 | Context Manager 增强 | Summarization 策略；tiktoken 精确计数 | 2d |
 
 ### 6.2 Phase 2 验收标准
 
@@ -509,6 +485,9 @@ class RuntimeServicer(AgentRuntimeServiceServicer):
   ✅ Grafana 仪表盘运行，告警规则生效
   ✅ Worker 滚动更新零停机
   ✅ 过载场景: 用户收到"排队中"提示
+  ✅ 人机交互: 高危工具确认弹窗 → 用户确认/拒绝 → Agent 继续/中止
+  ✅ 模型降级: 主模型限流 → 自动切换备用模型 → 客户端收到通知
+  ✅ Hook 系统: 可通过配置注入自定义钩子 (如日志、审计)
   ✅ 压力测试: 50 req/s 持续 10 分钟无错误
 ```
 
@@ -529,10 +508,12 @@ class RuntimeServicer(AgentRuntimeServiceServicer):
 | P3-5 | 响应缓存 | 语义相似 prompt 命中缓存；向量化 prompt + 余弦相似度 | 5d |
 | P3-6 | 分级模型路由 | 简单请求 → 轻量模型 (GPT-4o-mini)；复杂请求 → 强模型 (Claude Sonnet) | 3d |
 | P3-7 | Firecracker 评估 | 如沙箱并发 >500，评估 Firecracker microVM 替换 Docker | 5d |
-| P3-8 | Redis Streams 瓶颈评估 | 如事件吞吐 >100K/s，评估 NATS JetStream 或 Rust Event Bus | 3d |
+| P3-8 | Redis Streams 瓶颈评估 | 如事件吞吐 >100K/s，迁移到 NATS JetStream (EventPublisher/EventConsumer 接口已抽象) | 3d |
 | P3-9 | 多区域部署设计 | 就近接入 (边缘 Gateway)；跨区数据同步策略 | 5d |
 | P3-10 | 更多渠道接入 | Slack、微信公众号/小程序、Web Widget 等 | 5d |
 | P3-11 | 多租户支持 | 租户隔离 (数据/配额/模型配置)；租户级计费 | 5d |
+| P3-12 | Agent Memory Long-term | 向量存储 (pgvector/pg_trgm)；MemoryIndexer + MemorySearch；自动回忆注入 System Prompt | 5d |
+| P3-13 | Gateway Pipeline 处理器 | 内容安全检查 + PII 脱敏 + 审计日志；可配置 Processor 链 | 3d |
 
 ---
 
@@ -980,13 +961,17 @@ M2: 生产化 ─────────────────── 第 16 �
     ✅ JWT + RBAC + Rate Limiting
     ✅ 多实例 Gateway + Runtime Worker 池
     ✅ 首批渠道接入 (Telegram + Discord)
-    ✅ 监控 + 告警
+    ✅ Model Router 多 Provider + 四层 Fallback 防御
+    ✅ 人机交互 (SendInput + agent.input) 端到端
+    ✅ Hook 系统 + Skills 管理 + Agent Memory (基础)
+    ✅ 监控 + 告警 + OpenTelemetry 分布式追踪
     ✅ 10,000 连接压测通过
     ✅ 内测用户可使用
 
 M3: 规模化 ─────────────────── 第 24 周末
-    ✅ 内容安全 Pipeline
+    ✅ Gateway Pipeline 处理器 (内容安全/PII 脱敏/审计)
     ✅ 分级模型路由
+    ✅ Agent Memory Long-term (向量检索)
     ✅ 多租户支持
     ✅ 50,000 连接压测通过
     ✅ 公测上线
@@ -1001,7 +986,7 @@ M3: 规模化 ─────────────────── 第 24 �
 | R1 | 团队 Go/Python 经验不足，Phase 0/1 延期 | 中 | 高 | Phase 0 安排 1 周 Go/Python 培训 + pair programming |
 | R2 | gRPC 跨语言调试困难 | 中 | 中 | Phase 0 即建立 gRPC 调试工具链 (grpcurl, Postman gRPC, BloomRPC) |
 | R3 | Python grpcio 性能不足或 bug | 低 | 中 | 备选: grpclib (纯 Python async)；MVP 后根据实际数据决定 |
-| R4 | Redis Streams 在高吞吐下成为瓶颈 | 低 | 高 | Phase 2 压测验证；备选: NATS JetStream (技术方案已评估) |
+| R4 | Redis Streams 在高吞吐下成为瓶颈 | 低 | 高 | Phase 2 压测验证；EventPublisher/EventConsumer 接口已抽象，可平滑迁移到 NATS JetStream |
 | R5 | LLM Provider 频繁限流或故障 | 中 | 高 | 多 Provider 熔断降级 (Phase 2)；Key 池 + 配额监控 |
 | R6 | 沙箱容器逃逸 (C 端用户恶意输入) | 低 | 极高 | Phase 1 即启用 gVisor；限制网络+资源；定期安全审计 |
 | R7 | 分布式系统调试复杂度高 | 高 | 中 | Phase 1 即引入 OpenTelemetry 分布式追踪 |
@@ -1031,11 +1016,12 @@ Phase 0 确立 Proto 契约后，Go 和 Python 两组可以完全并行开发：
         Week 1-2         Week 3-4         Week 5-6         Week 7-8
         Phase 0          ─────────── Phase 1 ───────────
 
-Go 组:  [Proto + 骨架]  [WS + 路由]      [调度 + 限频]    [广播 + 集成]
+Go 组:  [Proto + 骨架]  [WS + 路由]      [调度 + 限频]    [事件消费 + 集成]
         ──────────────  ──────────────   ──────────────   ──────────────
 
-Py 组:  [Proto + 骨架]  [gRPC server]    [LLM 循环]       [沙箱 + 持久化]
-        ──────────────  ──────────────   ──────────────   ──────────────
+Py 组:  [Proto + 骨架]  [gRPC + Loop]    [Model Router    [沙箱 + 持久化
+        ──────────────  ──────────────    + Prompt]        + EventEmitter]
+                                         ──────────────   ──────────────
 
 DevOps: [CI + Compose]  [Redis/PG 配置]  [监控基础]       [集成测试环境]
         ──────────────  ──────────────   ──────────────   ──────────────
@@ -1066,7 +1052,7 @@ DevOps: [CI + Compose]  [Redis/PG 配置]  [监控基础]       [集成测试环
 | HTTP (Go) | net/http 标准库 | — | HTTP 服务 |
 | LLM SDK (Py) | anthropic / openai | latest | LLM 交互 |
 | 异步 (Py) | asyncio + uvloop | latest | 事件循环 |
-| 事件总线 | Redis Streams | 7.x | 跨服务事件传递 |
+| 事件传输 | Redis Streams | 7.x | 跨服务异步事件传递 (无独立进程) |
 | 热数据存储 | Redis | 7.x | 会话/路由/锁 |
 | 冷数据存储 | PostgreSQL | 16 | 历史/审计/配置 |
 | 沙箱 | Docker + gVisor (runsc) | latest | 代码执行隔离 |
@@ -1077,16 +1063,31 @@ DevOps: [CI + Compose]  [Redis/PG 配置]  [监控基础]       [集成测试环
 | 日志 (Go) | slog | 标准库 | 结构化日志 |
 | 日志 (Py) | structlog | latest | 结构化日志 |
 | CI | GitHub Actions | — | 构建/测试/部署 |
+| Token 计数 | tiktoken | latest | 精确 token 计数 (上下文管理) |
+| 向量存储 | pgvector | latest | Agent Memory 长期记忆 (Phase 3) |
 | 编排 | Kubernetes | 1.28+ | 生产部署 |
 
 ### 附录 B. 参考架构文档
 
-> 以下文档来自 OpenClaw 项目，Sahara 在架构设计上参考了其分层思路。
+**Sahara 设计文档（权威来源）**：
+
+| 文档 | 内容 | 编号 |
+| ---- | ---- | ---- |
+| [TECH-PROPOSAL-C-END-REFACTOR.md](../TECH-PROPOSAL-C-END-REFACTOR.md) | 技术方案 (架构设计 + 选型论证 + 成本分析) | — |
+| [GRPC-PROTOCOL-DESIGN.md](./GRPC-PROTOCOL-DESIGN.md) | gRPC 协议设计 (Gateway ↔ Runtime) | D1 |
+| [WS-PROTOCOL-DESIGN.md](./WS-PROTOCOL-DESIGN.md) | WebSocket 协议设计 (Client ↔ Gateway) | D2 |
+| [GATEWAY-ARCHITECTURE-DESIGN.md](./GATEWAY-ARCHITECTURE-DESIGN.md) | Gateway 架构设计 | D3 |
+| [RUNTIME-ARCHITECTURE-DESIGN.md](./RUNTIME-ARCHITECTURE-DESIGN.md) | Runtime 架构设计 (20 个模块) | D4 |
+| [EVENT-BUS-DESIGN.md](./EVENT-BUS-DESIGN.md) | 异步事件传输协议（Runtime ↔ Gateway 对接规范） | D5 |
+| [SANDBOX-DESIGN.md](./SANDBOX-DESIGN.md) | Sandbox 管理与演进 | D6 |
+| [API-SERVICE-DESIGN.md](./API-SERVICE-DESIGN.md) | API Service 设计 (C 端 RESTful HTTP) | D7 |
+| [OBSERVABILITY-DESIGN.md](./OBSERVABILITY-DESIGN.md) | 可观测性设计 (Metrics/Logs/Traces) | D8 |
+
+**OpenClaw 参考文档（现有架构）**：
 
 | 文档 | 参考价值 |
 | ---- | ---- |
-| [TECH-PROPOSAL-C-END-REFACTOR.md](./TECH-PROPOSAL-C-END-REFACTOR.md) | 技术方案 (架构设计 + 选型论证 + 成本分析) |
-| [GATEWAY-ARCHITECTURE.md](./gateway/GATEWAY-ARCHITECTURE.md) | Gateway 分层设计参考 |
-| [AGENT-RUNTIME-v2.md](./agent/AGENT-RUNTIME-v2.md) | Agent Runtime 八大子系统参考 |
-| [GATEWAY-PROTOCOL.md](./gateway/GATEWAY-PROTOCOL.md) | WS 协议设计参考 (JSON RPC 帧格式) |
-| [AGENT-RUNTIME-SANDBOX.md](./agent/AGENT-RUNTIME-SANDBOX.md) | 沙箱设计参考 (Docker 容器池思路) |
+| [GATEWAY-ARCHITECTURE.md](../openclaw/gateway/GATEWAY-ARCHITECTURE.md) | Gateway 分层设计参考 |
+| [AGENT-RUNTIME-v2.md](../openclaw/agent/AGENT-RUNTIME-v2.md) | Agent Runtime 八大子系统参考 |
+| [GATEWAY-PROTOCOL.md](../openclaw/gateway/GATEWAY-PROTOCOL.md) | WS 协议设计参考 (JSON RPC 帧格式) |
+| [AGENT-RUNTIME-SANDBOX.md](../openclaw/agent/AGENT-RUNTIME-SANDBOX.md) | 沙箱设计参考 (Docker 容器池思路) |

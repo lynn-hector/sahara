@@ -17,7 +17,7 @@
 
 3. [Gateway 设计与技术选型](#三gateway-设计与技术选型)
 4. [Agent Runtime 设计与技术选型](#四agent-runtime-设计与技术选型)
-5. [Event Router 设计与技术选型](#五event-router-设计与技术选型)
+5. [异步事件传输设计](#五异步事件传输设计)
 6. [Sandbox 沙箱技术选型](#六sandbox-沙箱技术选型)
 7. [通信协议选型：gRPC vs MQ](#七通信协议选型grpc-vs-mq)
 
@@ -75,7 +75,7 @@
 
 ### 2.1 目标架构
 
-系统有两条独立的通信路径——gRPC（同步调度）和 Event Bus（异步事件）。下图左右分开展示：
+系统有两条独立的通信路径——gRPC（同步调度）和 Redis Streams（异步事件传输）。下图左右分开展示：
 
 ```text
                           C 端用户 (Web/App/小程序/API)
@@ -104,16 +104,16 @@
            ▼     ▼     ▼            ▼                      │
   ═══════════════════════════════════════════════════════════════
   ║                                                             ║
-  ║  路径 A: gRPC 同步调度        路径 B: Event Bus 异步事件    ║
-  ║  Gateway → gRPC → Runtime    Runtime → publish → Event Bus  ║
-  ║  (提交任务/中止/等待结果)    Event Bus → subscribe → Gateway║
+  ║  路径 A: gRPC 同步调度        路径 B: 异步事件传输          ║
+  ║  Gateway → gRPC → Runtime    Runtime → XADD → Redis Streams║
+  ║  (提交任务/中止/查询)        Redis Streams → XREAD → Gateway║
   ║                              (流式 delta/工具/生命周期事件) ║
   ║                                                             ║
   ═══════════════════════════════════════════════════════════════
-           │     │                              ▲     ▲
-           │     │                              │     │
-           │     └──────────────────────────────┘     │
-           │           Event Bus 推送事件给 Gateway    │
+           │                                          ▲
+           │                                          │
+           │          Redis Streams (已有基础设施)      │
+           │          事件传输，无独立进程              │
            │                                          │
            ▼                                          │
   ┌──────────────────────────────────────────────────────────────┐
@@ -124,13 +124,14 @@
   │  │ (Agent)  │      │ (Agent)  │      │ (Agent)  │             │
   │  └────┬────┘      └────┬────┘      └────┬────┘             │
   │       │                │                │                    │
-  │       │   publish      │   publish      │   publish          │
+  │       │  XADD          │  XADD          │  XADD             │
   │       ▼                ▼                ▼                    │
   │  ┌──────────────────────────────────────────────────────┐   │
-  │  │              Event Router / Event Bus                 │   │
-  │  │              (NATS / Redis Streams / Rust Bus)        │   │
+  │  │              Redis Streams (事件传输层)               │   │
+  │  │              events:{session_key} per-session stream  │   │
   │  │                                                      │   │
-  │  │  接收事件 → 路由 → 聚合(150ms) → 持久化 → 扇出推送  │   │
+  │  │  ★ 不是独立进程 — Runtime 直接写 Redis，             │   │
+  │  │    Gateway 直接读 Redis。详见 EVENT-BUS-DESIGN.md    │   │
   │  └──────────────────────────────────────────────────────┘   │
   │                                                              │
   └──────────────────────────────────────────────────────────────┘
@@ -140,22 +141,24 @@
 
 | 路径 | 方向 | 协议 | 模式 | 用途 |
 | ---- | ---- | ---- | ---- | ---- |
-| **路径 A** | Gateway → Runtime | gRPC | 同步请求-响应 | 提交任务、中止任务、等待结果 |
-| **路径 B** | Runtime → Event Bus → Gateway | MQ (pub/sub) | 异步事件流 | LLM 流式 delta、工具调用事件、生命周期事件 |
+| **路径 A** | Gateway → Runtime | gRPC | 同步请求-响应 | 提交任务、中止任务、人机交互输入、查询状态 |
+| **路径 B** | Runtime → Redis Streams → Gateway | Redis XADD/XREAD | 异步事件流 | LLM 流式 delta、工具调用事件、生命周期事件、人机交互通知 |
 
-- **路径 A（gRPC）穿过 Event Bus 层直达 Runtime**——Event Bus 不参与调度
-- **路径 B（事件流）从 Runtime 向上经过 Event Bus 再扇出到所有 Gateway**——gRPC 不参与事件广播
+- **路径 A（gRPC）直达 Runtime**——Redis Streams 不参与调度
+- **路径 B（事件流）从 Runtime 写入 Redis Streams，Gateway 读取后推送给客户端**——gRPC 不参与事件广播
 - 两条路径完全独立，互不干扰
+- **重要**：路径 B 不涉及独立部署的"Event Bus"进程。Redis Streams 是已有 Redis 基础设施的功能，Runtime 和 Gateway 各自通过 Redis 客户端直接读写。详见 [异步事件传输协议](./sahara/EVENT-BUS-DESIGN.md)。
 
-### 2.2 五个独立进程组
+### 2.2 四个独立进程组
 
 | 进程组 | 职责 | 扩缩策略 |
 | ---- | ---- | ---- |
-| **Gateway** | WS 连接管理、实时事件推送、gRPC 调度分发、OpenAI 兼容 SSE API | 按连接数水平扩展 |
+| **Gateway** | WS 连接管理、实时事件推送（从 Redis Streams 消费）、gRPC 调度分发、事件聚合(150ms)、Pipeline 处理器 | 按连接数水平扩展 |
 | **API Service** | C 端 RESTful HTTP API：用户注册登录、会话 CRUD、文件上传、配额查询 | 按请求量水平扩展（无状态） |
-| **Agent Runtime Worker** | LLM 调用、工具执行、沙箱管理、会话持久化 | 按任务量水平扩展 |
-| **Event Router** | 事件接收、路由分发、限频聚合、内容安全、持久化 | 按消息吞吐扩展 |
-| **State Store** | 会话存储、用户数据、配置中心、路由表 (Redis/PostgreSQL) | 按数据量扩展 |
+| **Agent Runtime Worker** | LLM 调用、工具执行、沙箱管理、会话持久化、事件发射（XADD 到 Redis Streams） | 按任务量水平扩展 |
+| **State Store** | 会话存储、用户数据、配置中心、路由表、**事件传输** (Redis Streams) + 持久化 (PostgreSQL) | 按数据量扩展 |
+
+> **为什么没有独立的 Event Router / Event Bus 进程？** 在详细设计阶段，我们确定异步事件传输通过 Redis Streams 实现——Runtime 直接 `XADD` 写事件，Gateway 直接 `XREAD` 读事件，不需要中间进程。事件聚合(150ms)、Pipeline 处理器(内容安全/PII脱敏)、路由过滤等逻辑都在 **Gateway 侧**完成。这样做的好处是零新增依赖、零新增运维成本，且 Redis Streams 在 50K 在线规模内性能绰绰有余（>100K msg/s）。如果未来达到瓶颈，可迁移到 NATS JetStream，接口已抽象（`EventPublisher` / `EventConsumer`）。
 
 > **Gateway 与 API Service 的分离**：Gateway 专注 WebSocket 长连接和实时事件流，是有状态的（goroutine per conn）。
 > API Service 是纯无状态的 HTTP 请求-响应服务，负责 WS 连接建立前后的所有 CRUD 操作。
@@ -177,17 +180,17 @@
 ③ Runtime ← LLM 流式输出                  ③ Runtime ← LLM 流式输出
    (不变)                                     (不变)
 
-④ emitAgentEvent()                        ④ Runtime → Event Bus (MQ publish)
-   → 进程内 listeners Set                    → Event Router 路由 + 持久化
+④ emitAgentEvent()                        ④ Runtime → Redis Streams (XADD)
+   → 进程内 listeners Set                    → 事件持久化在 Redis 中
 
-⑤ Gateway → WS broadcast                  ⑤ Event Bus → Gateway (MQ subscribe)
-   → 150ms 限频                               → Gateway 广播给 WS 客户端
+⑤ Gateway → WS broadcast                  ⑤ Gateway ← Redis Streams (XREAD)
+   → 150ms 限频                               → 150ms 聚合 → Pipeline → WS 推送
 
 ⑥ Client 收到事件                          ⑥ Client 收到事件
    (不变)                                     (不变)
 ```
 
-**核心变化**：步骤 ② 从函数调用变为 gRPC；步骤 ④⑤ 从进程内回调变为 MQ 发布/订阅。
+**核心变化**：步骤 ② 从函数调用变为 gRPC；步骤 ④⑤ 从进程内回调变为 Redis Streams 发布/消费。
 
 ### 2.4 协议复用
 
@@ -215,7 +218,7 @@
 | ❶ | **WS 连接管理** | 接受连接、协议协商、帧解析、心跳维护、慢客户端检测 |
 | ❷ | **认证鉴权** | JWT 无状态验证（验证，不签发）、RBAC 权限、Rate Limiting |
 | ❸ | **消息路由与调度** | RPC 方法分发、agent → Runtime Worker gRPC 调度、负载均衡 |
-| ❹ | **事件广播** | 从 Event Bus 消费事件 → 按 session 广播给 WS 客户端 |
+| ❹ | **事件广播** | 从 Redis Streams 消费事件 → Pipeline 处理 → 按 session 广播给 WS 客户端 |
 | ❺ | **HTTP 服务（精简）** | OpenAI 兼容 SSE API (`/v1/chat/completions`)、WS 升级 (`/ws`)、运维端点 |
 | ❻ | **渠道管理** | 启停 Telegram/Discord/Slack 等渠道、账号生命周期、健康监控 |
 | ❼ | **状态管理** | 在线状态 (presence)、会话路由表、配置热加载 |
@@ -269,8 +272,8 @@ Go 的核心优势：goroutine 模型让每个 WS 连接可以有自己的读/�
 │                           ▼                                        │
 │  广播层                                                            │
 │  ┌──────────────────────────────────────────────────────────┐    │
-│  │  Event Consumer (NATS/Redis) → 按 session 广播 → WS 推送│    │
-│  │  150ms 限频 / 慢客户端保护                               │    │
+│  │  Event Consumer (Redis Streams XREAD) → Pipeline 处理   │    │
+│  │  → 150ms 限频 / 慢客户端保护 → 按 session WS 推送      │    │
 │  └──────────────────────────────────────────────────────────┘    │
 │                                                                    │
 │  状态层 (Redis): 连接元数据、session 路由表、presence、去重、限频  │
@@ -281,7 +284,7 @@ Go 的核心优势：goroutine 模型让每个 WS 连接可以有自己的读/�
 
 **goroutine per connection**：每个 WS 连接启动 2 个 goroutine（读+写），写操作通过 channel 串行化，避免并发写锁。
 
-**多实例事件路由**：用户可能连在 Gateway-1，但事件来自 Gateway-2。解法是所有 Gateway 都订阅 Event Bus，收到事件后检查"该 session 有没有连在我这里"，有就推送，无就丢弃。优化：用 sessionKey 做 topic 粒度订阅。
+**多实例事件路由**：用户可能连在 Gateway-1，但事件来自 Gateway-2。解法是所有 Gateway 都消费 Redis Streams，收到事件后检查"该 session 有没有连在我这里"，有就推送，无就丢弃。优化：用 sessionKey 做 stream 粒度订阅。
 
 **C 端限频**：三层防护——连接级（单连接每秒 N 个 RPC）、用户级（每分钟 M 个 agent 请求）、全局级（每秒 P 个 agent 请求），用 Redis 滑动窗口计数器实现。
 
@@ -296,7 +299,7 @@ Go 的核心优势：goroutine 模型让每个 WS 连接可以有自己的读/�
 | **gRPC** | `google.golang.org/grpc` | 官方库、与 Python 互通 |
 | **JSON** | `sonic` 或 `encoding/json` | 帧解析热路径需高性能 |
 | **Redis** | `go-redis/redis` v9 | 连接池、Pipeline、Streams |
-| **MQ** | `nats.go` / Redis Streams | 与 Event Bus 对接 |
+| **事件消费** | `go-redis/redis` v9 (Streams) | 从 Redis Streams 消费事件 |
 | **JWT** | `golang-jwt/jwt` v5 | C 端无状态认证标准 |
 | **日志** | `slog` (Go 1.21+) | 标准库、结构化、零依赖 |
 | **指标** | `prometheus/client_golang` | 标准 Prometheus |
@@ -305,33 +308,41 @@ Go 的核心优势：goroutine 模型让每个 WS 连接可以有自己的读/�
 
 ## 四、Agent Runtime 设计与技术选型
 
-### 4.1 八大子系统
+### 4.1 子系统全景
 
-现有 Runtime 包含 8 个子系统（详见 [AGENT-RUNTIME-v2.md](./agent/AGENT-RUNTIME-v2.md)）：
+现有 OpenClaw Runtime 包含 8 个子系统（详见 [AGENT-RUNTIME-v2.md](./openclaw/agent/AGENT-RUNTIME-v2.md)）。Sahara 新架构在此基础上扩展为 **20 个模块**，详见 [Runtime 架构设计 (D4)](./sahara/RUNTIME-ARCHITECTURE-DESIGN.md)。以下为核心模块概览：
 
-| # | 子系统 | 职责 |
-| ---- | ---- | ---- |
-| ① | **入口与调度** | 双层队列 (session lane + global lane)，防并发、防过载 |
-| ② | **模型与认证** | 模型解析、API Key 轮换、Rate Limit 冷却、模型降级 |
-| ③ | **运行环境** | 沙箱(Docker)、技能加载、上下文文件(AGENTS.md 等) |
-| ④ | **系统提示词** | ~24 个节段组合成 system prompt |
-| ⑤ | **工具系统** | 创建 + 9 层策略过滤 + 执行 (exec/read/write/browser/...) |
-| ⑥ | **AgentSession** | LLM 交互抽象 (prompt → 流式响应 → 工具调用循环) |
-| ⑦ | **事件与流式** | 10 种事件类型 → EventHandler → 三条输出路径 |
-| ⑧ | **上下文管理** | 四层防御 (截断 → 剪枝 → 压缩 → 溢出压缩) |
+| # | 模块 | 职责 | D4 章节 |
+| ---- | ---- | ---- | ---- |
+| ① | **gRPC Server (入口层)** | 接收 Gateway 请求、任务生命周期管理、信号量并发控制 | §3 |
+| ② | **Agent Loop (核心循环)** | LLM 交互 → 流式响应 → 工具调用 → 人机交互，每轮迭代的完整状态机 | §4 |
+| ③ | **EventEmitter (事件发射)** | 12 种事件类型 → 序列化 → XADD 到 Redis Streams | §5 |
+| ④ | **Model Router (模型管理)** | 多 Provider 适配、API Key 轮换、四层 Fallback 防御、Prompt Caching | §6 |
+| ⑤ | **Tools (工具系统)** | ToolTier 分级、ToolRegistry + ToolPolicy 9 层策略过滤 + ToolExecutor | §7 |
+| ⑥ | **System Prompt Builder** | 动态拼装 PromptSegment 节段（含 Memory Recall） | §8 |
+| ⑦ | **Sandbox Manager** | Docker/gVisor 容器池、生命周期管理、资源限制 | §9 |
+| ⑧ | **Skills 管理** | SkillTier/SkillMetadata/SkillLoader/SkillFilter，Prompt 驱动的多步引导 | §10 |
+| ⑨ | **Context Manager** | 四层防御：Eviction → Compaction → Summarization → Filtering | §11 |
+| ⑩ | **Agent Memory** | Working/Short-term/Long-term 三层记忆 + Embedder + MemorySearch | §12 |
+| ⑪ | **Hook System** | 12 个生命周期钩子点 + HookRunner + 优先级执行 + 错误隔离 | §13 |
+| ⑫ | **Dependencies 注入** | 集中容器管理所有子系统实例的创建和注入 | §14 |
+| — | 并发/错误/配置/安全 | 并发模型、错误分类与弹性、配置管理、安全架构总览 | §15-§19 |
 
 ### 4.2 新架构下的变化
 
-| 子系统 | 现有方式 | 新架构变化 | 幅度 |
+> 以下对比基于 OpenClaw 原有 8 个子系统。Sahara 新增的模块（Hook 系统、Agent Memory、Skills 等）在 OpenClaw 中不存在，属于全新设计。
+
+| OpenClaw 子系统 | 现有方式 | Sahara 新架构变化 | 幅度 |
 | ---- | ---- | ---- | ---- |
-| ① 入口与调度 | 进程内双层队列 | 全局排队在 Gateway 侧；Worker 内只保留 session lane | 大改 |
-| ② 模型与认证 | 本地配置 | 从 Redis/配置中心读取；Key 池集中管理 | 中改 |
-| ③ 运行环境 | 本地 Docker + 本地文件 | 沙箱同机部署；技能/上下文从集中存储加载 | 中改 |
-| ④ 系统提示词 | 本地构建 | 逻辑不变，输入数据源变了 | 小改 |
-| ⑤ 工具系统 | 本地创建 + 策略 | 逻辑不变；沙箱工具走本地容器 | 小改 |
-| ⑥ AgentSession | SDK 封装 | 核心重写：直接用 Python LLM SDK + 自建循环 | 重写 |
-| ⑦ 事件与流式 | 进程内 emit | 改为发布到 Event Bus (MQ) | 大改 |
-| ⑧ 上下文管理 | SDK 内置 | Python 重新实现截断/剪枝/压缩 | 中改 |
+| ① 入口与调度 | 进程内双层队列 | gRPC Server + asyncio.Semaphore 并发控制 | 重写 |
+| ② 模型与认证 | 本地配置 | Model Router: 多 Provider 适配 + Key 轮换 + 四层 Fallback | 重写 |
+| ③ 运行环境 | 本地 Docker + 本地文件 | Sandbox Manager: Docker/gVisor 容器池 + DI 容器注入 | 大改 |
+| ④ 系统提示词 | 本地构建 | System Prompt Builder: PromptSegment 动态拼装 + Memory Recall | 中改 |
+| ⑤ 工具系统 | 本地创建 + 策略 | Tools: ToolTier 分级 + ToolPolicy 9 层过滤（逻辑保留，架构升级） | 中改 |
+| ⑥ AgentSession | SDK 封装 | Agent Loop: 直接用 Python LLM SDK + 自建状态机 + 人机交互支持 | 重写 |
+| ⑦ 事件与流式 | 进程内 emit | EventEmitter: 12 种事件 → XADD Redis Streams（含人机交互事件） | 大改 |
+| ⑧ 上下文管理 | SDK 内置 | Context Manager: 四层防御 Python 重实现 + tiktoken 精确计数 | 中改 |
+| — (新增) | 不存在 | Hook System / Agent Memory / Skills / 安全架构 等全新模块 | 新建 |
 
 ### 4.3 为什么选 Python
 
@@ -356,7 +367,7 @@ async def run_agent_loop(client, messages, tools, system_prompt,
             model="claude-sonnet-4-20250514", system=system_prompt,
             messages=messages, tools=tools, max_tokens=8192,
         )
-        # 2. 处理流式响应，每个 delta 发射到 Event Bus
+        # 2. 处理流式响应，每个 delta 发射到 Redis Streams
         async for event in stream:
             if event.type == "content_block_delta" and event.delta.type == "text_delta":
                 await event_emitter.emit({
@@ -406,93 +417,97 @@ async def run_agent_loop(client, messages, tools, system_prompt,
 | **异步** | `asyncio` + `uvloop` | uvloop 提升 2-4x 事件循环性能 |
 | **沙箱** | `docker-py` + 容器池 | 沿用 Docker，池化优化 |
 | **会话存储** | `redis.asyncio` + `asyncpg` | Redis 热/PG 冷 |
-| **事件发射** | `nats-py` / `redis.asyncio` | 发到 Event Bus |
+| **事件发射** | `redis.asyncio` (Streams) | XADD 写入 Redis Streams |
 | **Token 计数** | `tiktoken` | 精确 token 计数 |
 | **配置** | `pydantic-settings` | 类型安全配置读取 |
 | **指标** | `prometheus-client` | Prometheus 标准指标 |
 
 ---
 
-## 五、Event Router 设计与技术选型
+## 五、异步事件传输设计
 
-### 5.1 为什么需要 Event Router
+> **设计定稿**：本章内容已在 [异步事件传输协议 (D5)](./sahara/EVENT-BUS-DESIGN.md) 中完整定义。以下为设计要点摘要。
 
-现有架构中事件广播通过 `emitAgentEvent()` 直接遍历内存回调函数。Gateway 和 Runtime 拆到不同进程后，需要一个**事件中转站**在两者之间传递事件。
+### 5.1 从 "Event Router" 到 "Redis Streams 协议"
+
+在技术方案早期，我们曾设想一个独立部署的"Event Router"进程负责事件路由、聚合和安全检查。**详细设计阶段明确否决了这一方案**：
 
 ```text
-现有 (同进程):  Runtime ──emitAgentEvent()──→ Gateway (内存回调)
-新架构 (跨进程): Runtime ──publish──→ Event Router ──subscribe──→ Gateway
+早期设想 (已否决):  Runtime ──publish──→ Event Router (独立进程) ──subscribe──→ Gateway
+最终设计 (采纳):    Runtime ──XADD──→ Redis Streams (已有基础设施) ──XREAD──→ Gateway
 ```
 
-### 5.2 五个核心职责
+**否决原因**：
+1. Redis Streams 在 50K 在线规模内性能远超需求（>100K msg/s vs 需求 ~4500 msg/s）
+2. 事件聚合(150ms)、Pipeline 处理器、路由过滤等逻辑都可以在 Gateway 侧完成（因为 Gateway 拥有连接状态信息）
+3. 增加独立进程意味着增加运维复杂度、故障点和延迟，但没有收益
+4. 接口已抽象为 `EventPublisher` / `EventConsumer`，未来可平滑迁移到 NATS JetStream
 
-| # | 职责 | 说明 |
-| ---- | ---- | ---- |
-| ❶ | **接收事件** | Runtime Worker 产出的 delta/tool/lifecycle 事件通过 MQ 发入 |
-| ❷ | **路由分发** | 根据 sessionKey 查找该 session 对应的 Gateway 实例 |
-| ❸ | **扇出广播** | 一条事件可能需要发给多个 Gateway（用户多设备在线） |
-| ❹ | **限频聚合** | LLM 每秒 20-30 个 delta，150ms 窗口合并后再转发 |
-| ❺ | **持久化** | 事件写入持久存储，Gateway 断连重连后可从断点回放 |
-
-### 5.3 一个事件的完整生命周期
+### 5.2 事件完整生命周期
 
 ```text
 用户: "帮我写排序"  →  Runtime 调用 LLM  →  LLM 流式返回 "好的，我来..."
 
 Step 1: Runtime 发射事件
-        Runtime-3 ──publish──→ Event Router
-          { runId: "run-abc", sessionKey: "user-123", stream: "assistant",
-            seq: 1, data: { text: "好" } }
+        Runtime EventEmitter → XADD events:sess_abc123
+          AgentEvent { run_id, session_key, type: DELTA, seq: 1, payload: "好" }
 
-Step 2: Event Router 做 150ms 窗口聚合
+Step 2: Gateway 消费事件
+        Gateway Consumer → XREAD events:sess_abc123
+          检查: sess_abc123 的用户连在我这里? → 是
+
+Step 3: Gateway 做 150ms 窗口聚合 (在 Gateway 内部)
         收集 seq 1-5: "好" "的" "，" "我" "来" → 合并为 "好的，我来"
 
-Step 3: Event Router 路由分发
-        查找 sessionKey="user-123" → Gateway-2
-        发送聚合后的事件给 Gateway-2
+Step 4: Gateway Pipeline 处理器 (在 Gateway 内部)
+        → 内容安全检查 → PII 脱敏 → 审计日志
 
-Step 4: Gateway-2 广播给用户
-        发送 WS event 帧: { type: "event", event: "chat",
-                            payload: { state: "delta", text: "好的，我来" } }
+Step 5: Gateway 推送给客户端
+        WS event 帧: { type: "event", event: "agent.delta",
+                        payload: { text: "好的，我来", stream: "assistant" } }
 ```
 
-### 5.4 三种实现方式
+### 5.3 技术选型与演进路径
 
-| 方式 | 技术 | 限频在哪做 | 优点 | 缺点 | 适合 |
-| ---- | ---- | ---- | ---- | ---- | ---- |
-| **NATS JetStream** | 现成 MQ | Gateway 侧 | 零开发，运维成熟 | 限频各 Gateway 各自做 | 方案 A |
-| **Redis Streams** | 已有 Redis | Gateway 侧 | 不新增依赖 | 单线程，超高吞吐可能瓶颈 | 方案 B/C |
-| **自研 Rust Bus** | 自研服务 | Bus 内部 | 极致性能，限频集中 | 开发成本高 | 方案 C |
+| 阶段 | 技术选择 | 适用规模 | 说明 |
+| ---- | ---- | ---- | ---- |
+| **Phase 1-2** | Redis Streams | ≤50K 在线 | 零新增依赖，已有 Redis 基础设施 |
+| **Phase 3** (按需) | NATS JetStream | >50K 在线 | 如 Redis Streams 成为瓶颈，迁移只换实现 |
+| **不做** | 自研 Event Bus | — | 事件传输是已解决问题，不是业务护城河 |
 
-**建议**：起步用 NATS/Redis Streams（零开发成本），性能瓶颈出现后再考虑自研。
+### 5.4 Gateway 侧 Pipeline 处理器
 
-### 5.5 Event Bus 管道处理器（内容安全等）
-
-C 端场景需要在事件传输过程中做自定义处理。推荐 **Pipeline 模式**：
+聚合和安全检查在 Gateway 消费事件后、推送给客户端前执行：
 
 ```text
-事件进入 Event Bus → Processor 1: 内容安全检查 (正则/API)
-                   → Processor 2: 数据脱敏 (PII 替换)
-                   → Processor 3: 审计日志 (异步写入)
-                   → Processor 4: 限频聚合 (150ms 窗口)
-                   → Processor 5: 计量统计 (token/计费)
-                   → 路由转发给 Gateway
+Gateway 消费 Redis Streams
+  │
+  ▼
+Pipeline Runner (Gateway 内部)
+  ├── Processor 1: 内容安全检查 (正则快筛)
+  ├── Processor 2: PII 脱敏 (手机号/身份证/邮箱)
+  ├── Processor 3: 审计日志 (异步旁路写入)
+  └── 150ms Delta 聚合 (减少 WS 帧频)
+  │
+  ▼
+推送给 WS 客户端
 ```
 
-推荐**分层安全架构**：Runtime 做快速过滤（正则，<0.1ms）→ Event Bus 做策略检查（安全 API，可同步拦截或异步旁路）→ Gateway 做用户级策略（年龄/地区）。
+**分层安全架构**：
+- **Layer 1** — Runtime (agent_loop 内)：正则快筛 SQL 注入/XSS/prompt 注入，<0.1ms
+- **Layer 2** — Gateway Pipeline：策略规则(敏感词库/PII 脱敏/审计)，<5ms
+- **Layer 3** — Gateway (推送前)：用户级策略(年龄/地区内容限制)，<1ms
 
-### 5.6 数据持久化策略
-
-"LLM 数据"包含四种类型，各有不同的持久化归属：
+### 5.5 数据持久化策略
 
 | 数据类型 | 谁写 | 存到哪 | 保留多久 |
 | ---- | ---- | ---- | ---- |
 | **会话历史** (messages[]) | Agent Runtime | PostgreSQL | 永久 (用户可删) |
-| **流式事件** (delta/tool) | Event Bus | NATS/Redis Stream | 短期 (小时~天) |
+| **流式事件** (delta/tool) | Runtime → Redis Streams | Redis Streams (MAXLEN ~5000) | 短期 (小时~天) |
 | **运行元数据** (token/model/耗时) | Agent Runtime | PostgreSQL | 永久 |
-| **审计日志** (谁/什么时候/说了什么) | Event Bus Pipeline | 审计存储 | 长期 (3-5 年) |
+| **审计日志** | Gateway Pipeline | PG / 对象存储 | 长期 (3-5 年) |
 
-**关键原则**：Runtime 是会话数据的权威来源（一轮结束后写入）；Event Bus 的持久化是为传输可靠性（不丢事件），不是业务数据。
+**关键原则**：Runtime 是会话数据的权威来源；Redis Streams 的持久化是为传输可靠性（断线回放），不是业务数据。
 
 ---
 
@@ -564,29 +579,31 @@ Gateway 需要在 50ms 内告诉用户"任务被接受"还是"系统繁忙"。gR
 
 6 个具体原因：①即时反馈 ②丰富错误码 ③精确路由到特定 Worker ④内建超时 deadline ⑤中止能力 (AbortTask) ⑥protobuf 类型安全。
 
-### 7.3 事件流为什么选 MQ（不选 gRPC）
+### 7.3 事件流为什么选 Redis Streams（不选 gRPC）
 
-事件流是一对多（一个 Runtime 的事件需发给多个 Gateway），Runtime 不关心谁消费，且需要中间缓冲。MQ 的 pub/sub 天然适合扇出 + 持久化 + 背压控制。
+事件流是一对多（一个 Runtime 的事件需发给多个 Gateway），Runtime 不关心谁消费，且需要中间缓冲。Redis Streams 天然适合扇出 + 持久化 + 背压控制，且 **零新增依赖**（利用已有 Redis 基础设施）。
 
 ### 7.4 混合协作
 
 ```text
-同步路径 (gRPC):  Client → Gateway → gRPC → Runtime (提交任务/中止/等待)
-事件路径 (MQ):    Runtime → MQ → Event Bus → Gateway → WS → Client (流式事件)
+同步路径 (gRPC):  Client → Gateway → gRPC → Runtime (提交任务/中止/人机交互)
+事件路径 (Redis): Runtime → XADD → Redis Streams → XREAD → Gateway → WS → Client (流式事件)
 ```
 
-### 7.5 过载降级：MQ 做溢出队列
+### 7.5 过载降级：Redis Streams 做溢出队列
 
-所有 Worker 忙时 gRPC 返回 UNAVAILABLE，Gateway 可降级为放入 MQ 排队，Worker 空闲后自动消费。告诉用户"排队中，预计等待 30 秒"。
+所有 Worker 忙时 gRPC 返回 UNAVAILABLE，Gateway 可降级为放入 Redis Streams 排队，Worker 空闲后自动消费。告诉用户"排队中，预计等待 30 秒"。
 
-### 7.6 MQ 选项对比
+### 7.6 事件传输技术对比与演进
 
-| MQ 技术 | 延迟 | 持久化 | 扇出 | 运维 | 推荐 |
+| 技术 | 延迟 | 持久化 | 扇出 | 运维 | 适用阶段 |
 | ---- | ---- | ---- | ---- | ---- | ---- |
-| **NATS JetStream** | ~0.3ms | ✅ | ✅ | 低 (单二进制) | 方案 A 首选 |
-| **Redis Streams** | ~0.5ms | ✅ | ✅ (消费组) | 低 (已有 Redis) | 方案 B/C |
-| **Kafka** | ~5ms | ✅ | ✅ | 高 | 百万级事件/秒 |
-| **RabbitMQ** | ~1ms | ✅ | ✅ | 中 | 复杂路由规则 |
+| **Redis Streams** ★ | ~0.5ms | ✅ | ✅ (消费组) | 低 (已有 Redis) | **Phase 1-2 (采用)** |
+| **NATS JetStream** | ~0.3ms | ✅ | ✅ | 低 (单二进制) | Phase 3 (备选) |
+| **Kafka** | ~5ms | ✅ | ✅ | 高 | 百万级事件/秒 (不推荐) |
+| **自研 Rust Bus** | ~0.1ms | ✅ | ✅ | 高 (自维护) | 不做 |
+
+> **最终决策**：Phase 1-2 使用 Redis Streams（零新增依赖）；如 Phase 3 达到瓶颈，迁移到 NATS JetStream。接口已抽象为 `EventPublisher` / `EventConsumer`。
 
 ---
 
@@ -611,9 +628,9 @@ Gateway 需要在 50ms 内告诉用户"任务被接受"还是"系统繁忙"。gR
            ▼  ▼                       ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │  Agent Runtime Worker (Python)                                    │
-│  gRPC server / LLM SDK / 工具执行 / 事件发射 → NATS publish     │
+│  gRPC server / LLM SDK / 工具执行 / 事件发射 → Redis XADD       │
 └──────────────────────────────────────────────────────────────────┘
-Event Router: NATS JetStream / Redis Streams
+事件传输: Redis Streams (Phase 1-2) → 可选迁移 NATS (Phase 3)
 ```
 
 ### 方案 B：Rust + Python
@@ -621,17 +638,18 @@ Event Router: NATS JetStream / Redis Streams
 > **定位**：极致性能、最低资源消耗
 
 ```text
-┌──────────────────────────────────┐  ┌───────────────────────────┐
-│  Gateway (Rust)                   │  │  Event Bus (Rust)         │
-│  tokio+axum+tungstenite/tonic    │  │  内建 pub/sub / Redis Str.│
-└──────────┬───────────────────────┘  └─────────┬─────────────────┘
-           │ gRPC (tonic↔grpcio)               │ Redis Streams
-           ▼                                    ▼
+┌──────────────────────────────────┐
+│  Gateway (Rust)                   │
+│  tokio+axum+tungstenite/tonic    │
+│  事件消费 + 聚合 + Pipeline      │
+└──────────┬───────────────────────┘
+           │ gRPC (tonic↔grpcio)    ↑ XREAD Redis Streams
+           ▼                        │
 ┌──────────────────────────────────────────────────────────────────┐
 │  Agent Runtime Worker (Python)                                    │
 │  gRPC server / LLM SDK / 事件发射 → Redis XADD                  │
 └──────────────────────────────────────────────────────────────────┘
-State: Redis Cluster + PostgreSQL
+State: Redis Cluster (含 Streams) + PostgreSQL
 ```
 
 ### 方案 C：Go + Rust + Python
@@ -641,16 +659,18 @@ State: Redis Cluster + PostgreSQL
 ```text
 ┌─────────────────────────────────┐
 │  Gateway (Go)                    │ ← 快速迭代，WS/HTTP
-│  gRPC client / 消费事件          │
+│  gRPC client / 事件消费+聚合    │
+│  Pipeline 处理器 (内容安全)      │
 └──────────┬────────┬─────────────┘
-           │gRPC    │consume
-┌──────────▼──────┐ │  ┌──────────────────────────────────────────┐
-│ Runtime (Python) │ │  │  Event Bus (Rust)                        │
-│ gRPC server      │ │  │  高性能事件路由 / 150ms 聚合 / 安全检查 │
-│ LLM / 工具 / 沙箱│ └──│  背压 / WAL 持久化 / 分区扩展           │
-│ publish 事件 ───→│───→│                                          │
-└──────────────────┘    └──────────────────────────────────────────┘
-State: Redis + PostgreSQL
+           │gRPC    │XREAD (Redis Streams)
+           ▼        │
+┌──────────────────┐ │
+│ Runtime (Python)  │ │  如 Redis Streams 瓶颈 → 可选 Rust 高性能事件层
+│ gRPC server       │ │  (Phase 3+, 接口已抽象)
+│ LLM / 工具 / 沙箱 │ │
+│ XADD 事件 ──→ Redis Streams ──→┘
+└──────────────────┘
+State: Redis (含 Streams) + PostgreSQL
 ```
 
 ---
@@ -670,7 +690,7 @@ State: Redis + PostgreSQL
   ├─ ★ 第 1 轮 LLM 调用               ~3-30s   (网络 IO 等待，占 90%+)
   ├─ 工具执行 (如果有)                ~0.1-10s  (docker exec)
   ├─ ★ 第 2 轮 LLM 调用               ~3-30s   (又是 IO 等待)
-  ├─ 事件发射到 Event Bus             ~1ms      (MQ publish)
+  ├─ 事件发射到 Redis Streams          ~1ms      (XADD)
   └─ 会话持久化                       ~5ms      (Redis write)
 
   关键发现: 90%+ 的时间在等待 LLM API 响应 (IO 等待)
@@ -698,7 +718,7 @@ State: Redis + PostgreSQL
 | gRPC 调度 | ~1ms | 10w+ QPS | 不是 |
 | Runtime 准备 | ~50-200ms | 随 Worker 数 | 次瓶颈 (沙箱分配) |
 | **LLM API 调用** | **3-30s** | **Provider 限制** | **真正瓶颈** |
-| Event Bus | ~0.5ms | 100w/s | 不是 |
+| Redis Streams | ~0.5ms | 100w/s | 不是 |
 | WS 广播 | ~1ms | 随 Gateway 数 | 不是 |
 
 **结论**：LLM API 是真正瓶颈（延迟最高、吞吐受 provider 限制）。Runtime 自身不是瓶颈——它 90% 时间在等 IO。
@@ -707,12 +727,11 @@ State: Redis + PostgreSQL
 
 | 组件 | 实例数 | 规格 | 说明 |
 | ---- | ---- | ---- | ---- |
-| **Gateway (Go)** | 1-2 | 2C4G | 10000 连接 × 8KB ≈ 80MB，绑绑有余 |
+| **Gateway (Go)** | 1-2 | 2C4G | 10000 连接 × 8KB ≈ 80MB，含事件消费 + 150ms 聚合 + Pipeline |
 | **Runtime (Python)** | 14-28 | 4C8G | 225 并发 / 8 per Worker ≈ 28 Worker |
-| **Event Bus** | 1 | 2C4G | 4500 事件/秒，远低于能力上限 |
-| **Redis** | 1 | 4G | session 元数据 + 路由表 + 锁 |
+| **Redis** | 1 | 4-8G | session 元数据 + 路由表 + 锁 + **Redis Streams 事件传输** (~2GB) |
 | **PostgreSQL** | 1 | 按数据量 | 每小时 ~10000 次写入 |
-| **总计** | — | — | **Gateway 1 台 + Runtime 7-14 台 + 基础设施 3 台 ≈ 11-18 台** |
+| **总计** | — | — | **Gateway 1 台 + Runtime 7-14 台 + 基础设施 2 台 ≈ 10-17 台** |
 
 Runtime 占总资源的 ~70%——但这不是因为 Python 慢，而是 LLM API 调用本身就要 15 秒/次。
 
@@ -732,11 +751,10 @@ Runtime 占总资源的 ~70%——但这不是因为 Python 慢，而是 LLM API
 | 资源 | 方案 A (Go+Py) | 方案 B (Rust+Py) | 方案 C (Go+Rust+Py) |
 | ---- | ---- | ---- | ---- |
 | Gateway | 1× 2C4G (~$30) | 1× 2C2G (~$20) | 1× 2C4G (~$30) |
-| Event Router | 1× NATS 2C4G (~$30) | 含在 Rust 服务中 | 1× Rust 2C4G (~$30) |
 | Runtime Worker | 7× 4C8G (~$700) | 7× 4C8G (~$700) | 7× 4C8G (~$700) |
-| Redis | 1× 4G (~$50) | 1× 4G (~$50) | 1× 4G (~$50) |
+| Redis (含 Streams) | 1× 8G (~$80) | 1× 8G (~$80) | 1× 8G (~$80) |
 | PostgreSQL | 1× (~$50) | 1× (~$50) | 1× (~$50) |
-| **机器总费用/月** | **~$860** | **~$820** | **~$860** |
+| **机器总费用/月** | **~$860** | **~$850** | **~$860** |
 | **LLM API 费用/月** | **~$3,000-10,000** | **~$3,000-10,000** | **~$3,000-10,000** |
 
 **关键洞察**：机器成本只占总成本的 10-20%，**LLM API 费用才是大头**。三个方案的机器差异不到 $50/月，但 LLM API 费用完全相同。语言选型对总成本影响极小，选择应基于开发效率和团队能力。
@@ -809,31 +827,43 @@ Runtime 占总资源的 ~70%——但这不是因为 Python 慢，而是 LLM API
 ```text
 Phase 1: MVP (1-2 月)  ← 方案 A
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  • Go Gateway (WS + 基础路由 + gRPC client)
+  • Go Gateway (WS + 基础路由 + gRPC client + Redis Streams 消费)
   • Go API Service (注册/登录/Token 刷新 + 会话 CRUD + 文件上传)
   • Go 共享包 pkg/ (auth/model/store/errcode)
-  • Python Runtime (gRPC server + LLM + Docker 沙箱池)
-  • NATS/Redis Streams 事件广播
+  • Python Runtime 核心:
+    - gRPC Server + Agent Loop + EventEmitter
+    - Model Router (单 Provider) + System Prompt Builder
+    - Tools (exec/read/write) + Docker 沙箱池
+    - Context Manager + 基础配置管理
+  • Redis Streams 事件传输 (零新增依赖)
   • Redis + PostgreSQL 存储
   → 产出: Gateway + API + Runtime 端到端打通，前端可完整跑通用户流程
 
 Phase 2: 生产化 (2-4 月)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   • Gateway 多实例 + LB 路径路由 (/ws → GW, /api/* → API)
+  • Gateway 150ms 聚合 + Pipeline 处理器 (Phase 2 后半段)
   • API Service: OAuth 三方登录、用量统计、系统公告
-  • Runtime Worker 池 + 负载均衡
+  • Runtime 新增模块:
+    - Model Router 多 Provider + 四层 Fallback 防御
+    - Skills 管理 + Hook 系统 (生命周期钩子)
+    - 人机交互 (SendInput gRPC + agent.input WS)
+    - Agent Memory (Working + Short-term)
   • JWT 认证 + 三层 Rate Limiting
+  • Sticky Affinity (任务级亲和路由，支持人机交互)
   • 渠道管理迁移
-  • 监控 + 告警 (Prometheus/Grafana)
-  → 产出: 可承载 10w 并发的生产系统
+  • 监控 + 告警 (Prometheus/Grafana) + OpenTelemetry 分布式追踪
+  → 产出: 可承载 10K 在线用户的生产系统
 
-Phase 3: 性能优化 (4-6 月)  ← 可选演进到方案 C
+Phase 3: 性能优化 (4-6 月)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  • 如果 NATS 成为瓶颈 → Rust Event Bus 替换
+  • 如 Redis Streams 成为瓶颈 → 迁移到 NATS JetStream (接口已抽象)
   • 沙箱 + gVisor (系统调用级隔离)
-  • 内容安全 Pipeline
+  • 内容安全 Pipeline (Gateway 侧)
   • 会话数据冷热分离
-  → 产出: P99 延迟 < 1ms 的事件广播
+  • Agent Memory Long-term (向量检索)
+  • 分级模型路由 (简单请求 → 轻量模型)
+  → 产出: 50K 在线、P99 事件延迟 < 200ms
 
 Phase 4: 大规模 (6+ 月)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -841,6 +871,7 @@ Phase 4: 大规模 (6+ 月)
   • Firecracker microVM 沙箱
   • Runtime 支持 GPU 调度 (本地模型)
   • 多区域部署 + 事件回放 + 审计
+  • 多租户隔离 (数据/配额/模型配置)
   → 产出: 百万级并发系统
 ```
 
@@ -859,9 +890,10 @@ Phase 4: 大规模 (6+ 月)
 | [WS-PROTOCOL-DESIGN.md](./sahara/WS-PROTOCOL-DESIGN.md) | D2: WebSocket 协议设计 (Client ↔ Gateway) |
 | [GATEWAY-ARCHITECTURE-DESIGN.md](./sahara/GATEWAY-ARCHITECTURE-DESIGN.md) | D3: Gateway 架构设计 |
 | [RUNTIME-ARCHITECTURE-DESIGN.md](./sahara/RUNTIME-ARCHITECTURE-DESIGN.md) | D4: Runtime 架构设计 |
-| [EVENT-BUS-DESIGN.md](./sahara/EVENT-BUS-DESIGN.md) | D5: Event Bus 架构设计 |
+| [EVENT-BUS-DESIGN.md](./sahara/EVENT-BUS-DESIGN.md) | D5: 异步事件传输协议（Runtime ↔ Gateway 对接规范） |
 | [SANDBOX-DESIGN.md](./sahara/SANDBOX-DESIGN.md) | D6: Sandbox 管理与演进 |
 | [API-SERVICE-DESIGN.md](./sahara/API-SERVICE-DESIGN.md) | D7: API Service 设计 (C 端 RESTful HTTP) |
+| [OBSERVABILITY-DESIGN.md](./sahara/OBSERVABILITY-DESIGN.md) | D8: 可观测性设计 (Metrics/Logs/Traces) |
 
 **OpenClaw 参考文档（现有架构）**：
 

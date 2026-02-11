@@ -5,8 +5,11 @@
 >
 > 关联文档：
 > - [gRPC 协议设计](./GRPC-PROTOCOL-DESIGN.md) — Runtime 作为 gRPC Server 暴露服务（D1）
-> - [Event Bus 架构设计](./EVENT-BUS-DESIGN.md) — Runtime 发射事件到 Event Bus（D5）
+> - [异步事件传输协议](./EVENT-BUS-DESIGN.md) — Runtime ↔ Gateway 事件传输规范（D5）
 > - [Sandbox 管理架构](./SANDBOX-DESIGN.md) — 沙箱容器池详细设计（D6）
+> - [上下文管理架构](./CONTEXT-MANAGEMENT-DESIGN.md) — 知识比特率优化、四种策略 (卸载/压实/摘要/过滤) 详细设计（D7）
+> - [Agent Memory 架构](./AGENT-MEMORY-DESIGN.md) — 三层记忆体系 (工作/短期/长期)、Session Store、Knowledge Store（D8）
+> - [可观测性架构](./OBSERVABILITY-DESIGN.md) — Metrics/Logs/Traces 三支柱，全局视角设计（D9）
 > - [技术方案 §四](./TECH-PROPOSAL-C-END-REFACTOR.md) — Runtime 八大子系统与选型
 > - [OpenClaw AGENT-RUNTIME-v2.md](./openclaw/agent/AGENT-RUNTIME-v2.md) — 原始架构参考
 
@@ -30,10 +33,10 @@
    - [5.9 各后端特性对比](#59-各后端特性对比)
    - [5.10 迁移策略](#510-迁移策略)
 6. [模型管理 (Model Router)](#六模型管理-model-router)
+   - [6.8 Fallback 系统 (多层容错)](#68-fallback-系统-多层容错)
 7. [工具系统 (Tools)](#七工具系统-tools)
    - [7.1 工具全生命周期](#71-工具全生命周期)
-   - [7.2 工具接口](#72-工具接口)
-   - [7.3 工具优先级与分层](#73-工具优先级与分层)
+   - [7.2 工具接口与优先级分层](#72-工具接口与优先级分层)
    - [7.4 工具扩展机制](#74-工具扩展机制)
    - [7.5 工具定义详解](#75-工具定义详解)
    - [7.6 工具注册与策略过滤](#76-工具注册与策略过滤)
@@ -63,13 +66,33 @@
    - [9.8 包结构](#98-包结构)
 10. [Skills 管理](#十skills-管理)
 11. [上下文管理 (Context Manager)](#十一上下文管理-context-manager)
-12. [会话管理 (Session Store)](#十二会话管理-session-store)
-13. [Dependencies 注入与启动流程](#十三dependencies-注入与启动流程)
-14. [并发模型](#十四并发模型)
-15. [错误处理与弹性](#十五错误处理与弹性)
-16. [配置管理](#十六配置管理)
-17. [可观测性](#十七可观测性)
-18. [Phase 1 最小实现范围](#十八phase-1-最小实现范围)
+   - [11.1 核心接口](#111-核心接口)
+   - [11.2 架构要点](#112-架构要点)
+   - [11.3 包结构](#113-包结构)
+12. [Agent Memory (记忆体系)](#十二agent-memory-记忆体系)
+13. [Hook 系统 (生命周期钩子)](#十三hook-系统-生命周期钩子)
+   - [13.1 Hook 在 Agent Loop 流程中的位置](#131-hook-在-agent-loop-流程中的位置)
+   - [13.2 Hook 类型全览](#132-hook-类型全览)
+   - [13.3 核心抽象](#133-核心抽象)
+   - [13.4 HookRunner — 执行引擎](#134-hookrunner--执行引擎)
+   - [13.5 每种 Hook 的输入与输出](#135-每种-hook-的输入与输出)
+   - [13.6 与 Agent Loop 的集成](#136-与-agent-loop-的集成)
+   - [13.7 优先级与错误处理](#137-优先级与错误处理)
+   - [13.8 内置 Hook 与扩展 Hook](#138-内置-hook-与扩展-hook)
+   - [13.9 Hook 与 EventEmitter 的边界](#139-hook-与-eventemitter-的边界)
+   - [13.10 与 Dependencies 的集成](#1310-与-dependencies-的集成)
+   - [13.11 扩展 Hook 注册 (Phase 2+)](#1311-扩展-hook-注册-phase-2)
+   - [13.12 性能考量](#1312-性能考量)
+   - [13.13 可观测性](#1313-可观测性)
+   - [13.14 包结构](#1314-包结构)
+   - [13.15 Phase 规划](#1315-phase-规划)
+14. [Dependencies 注入与启动流程](#十四dependencies-注入与启动流程)
+15. [并发模型](#十五并发模型)
+16. [错误处理与弹性](#十六错误处理与弹性)
+17. [配置管理](#十七配置管理)
+18. [可观测性](#十八可观测性)
+19. [安全架构总览](#十九安全架构总览)
+20. [Phase 1 最小实现范围](#二十phase-1-最小实现范围)
 
 ---
 
@@ -93,10 +116,10 @@
 │  ┌─── 任务执行层 ──────────────────────────────────────────────────┐   │
 │  │                                                                  │   │
 │  │  ┌────────────┐  ┌────────────┐  ┌────────────┐                │   │
-│  │  │ Model      │  │ Session    │  │ Sandbox    │                │   │
-│  │  │ Router     │  │ Store      │  │ Manager    │                │   │
+│  │  │ Model      │  │ Agent      │  │ Sandbox    │                │   │
+│  │  │ Router     │  │ Memory     │  │ Manager    │                │   │
 │  │  │ (模型选择   │  │ (会话加载   │  │ (沙箱分配   │                │   │
-│  │  │  Key 轮换)  │  │  历史恢复)  │  │  容器池)   │                │   │
+│  │  │  Key 轮换)  │  │  记忆召回)  │  │  容器池)   │                │   │
 │  │  └──────┬─────┘  └──────┬─────┘  └──────┬─────┘                │   │
 │  │         └───────────────┼───────────────┘                       │   │
 │  │                         ▼                                        │   │
@@ -130,16 +153,21 @@
 
 ### 1.2 子系统职责与定位
 
-| # | 子系统 | 核心职责 | 技术选型 | Python 模块 |
-| --- | --- | --- | --- | --- |
-| ① | 入口与调度 | 接收 Gateway gRPC 请求 | grpcio async + asyncio Semaphore | `server.py` |
-| ② | 模型与认证 | 模型选择、Key 轮换、降级 | Redis 集中配置 + Key 池 | `models/` |
-| ③ | 运行环境 | 沙箱容器分配与回收 | 同机 Docker 池 + 集中存储 | `sandbox/` |
-| ④ | 系统提示词 | 多段落动态拼接 | Redis/PG 数据源 | `prompt/` |
-| ⑤ | 工具系统 | 工具创建、策略过滤、执行 | 沙箱隔离 + 安全确认 | `tools/` |
-| ⑥ | Agent Loop | **核心**: LLM 流式交互 + 工具循环 | LLM SDK 直调 + 自建循环 | `agent_loop.py` |
-| ⑦ | 事件与流式 | 实时发布执行事件 | Redis Streams XADD | `events/` |
-| ⑧ | 上下文管理 | 四层防御确保不超窗口 | tiktoken + LLM 摘要 | `context/` |
+| # | 子系统 | 核心职责 | 技术选型 | Python 模块 | 章节 |
+| --- | --- | --- | --- | --- | --- |
+| ① | 入口与调度 | 接收 Gateway gRPC 请求, Worker 生命周期 | grpcio async + asyncio Semaphore | `server.py`, `worker.py` | §3 |
+| ② | Agent Loop | **核心**: LLM 流式交互 + 工具循环 + 人机交互 | LLM SDK 直调 + 自建循环 | `agent_loop.py` | §4 |
+| ③ | 事件发射器 | 实时发布执行事件 (可插拔后端) | Redis Streams / Kafka / NATS | `events/` | §5 |
+| ④ | 模型管理 | 模型选择、Key 池轮换、Session 级亲和、降级 | Redis 集中配置 + Key 池 | `models/` | §6 |
+| ⑤ | 工具系统 | 工具创建、策略过滤、沙箱执行、分层优先级 | 沙箱隔离 + 安全确认 | `tools/` | §7 |
+| ⑥ | 系统提示词 | 8 段落动态组装, 缓存友好排列 | Redis/PG 数据源 | `prompt/` | §8 |
+| ⑦ | 沙箱管理 | 沙箱容器分配与回收 (可插拔后端) | Docker / gVisor / Firecracker | `sandbox/` | §9 |
+| ⑧ | Skills 管理 | 技能加载、过滤、排序、沙箱同步 | SKILL.md + 提示词驱动 | `skills/` | §10 |
+| ⑨ | 上下文管理 | 四种策略最大化知识比特率, 缓解注意力衰减 | 卸载 + 压实 + 摘要 + 过滤 | `context/` | §11 |
+| ⑩ | Agent Memory | 三层记忆: 工作/短期/长期 | Redis + PG + pgvector | `memory/` | §12 |
+| ⑪ | 错误处理与弹性 | 分类处理、指数退避、Key 熔断、模型降级 | 统一异常体系 + 5 层防御 | 贯穿各模块 | §16 |
+| ⑫ | 可观测性 | Metrics (8 层) + Logs + Traces | Prometheus + structlog + OTel | 贯穿各模块 | [独立文档](./OBSERVABILITY-DESIGN.md) |
+| ⑬ | Hook 系统 | 生命周期钩子, 12 类扩展点, 串行/并行执行 | asyncio + 链式 handler | `hooks/` | §13 |
 
 ---
 
@@ -156,10 +184,10 @@ runtime/
 │   │
 │   ├── models/                     # 模型管理
 │   │   ├── __init__.py
-│   │   ├── router.py               # 模型选择 + Provider 路由
-│   │   ├── providers.py            # Anthropic / OpenAI 客户端封装
-│   │   ├── key_pool.py             # API Key 池 + 轮换 + 冷却
-│   │   └── fallback.py             # 模型降级链
+│   │   ├── router.py               # 模型选择 + Session 亲和 + Provider 路由
+│   │   ├── providers.py            # Anthropic / OpenAI 客户端封装 + ProviderAdapter
+│   │   ├── key_pool.py             # API Key 池 + 轮换 + 冷却 + 熔断
+│   │   └── fallback.py             # Fallback 系统: FallbackRunner + 错误分类 + 降级链
 │   │
 │   ├── tools/                      # 工具系统
 │   │   ├── __init__.py
@@ -191,19 +219,35 @@ runtime/
 │   │   ├── prompt.py               # 技能提示词生成 (<available_skills>)
 │   │   └── sync.py                 # 技能同步到沙箱
 │   │
-│   ├── session/                    # 会话管理
+│   ├── memory/                     # Agent Memory (详见 AGENT-MEMORY-DESIGN.md)
 │   │   ├── __init__.py
-│   │   ├── store.py                # Redis 热 + PG 冷
-│   │   ├── lock.py                 # session 级分布式锁
-│   │   └── history.py              # 消息历史操作
+│   │   ├── config.py               # MemoryConfig
+│   │   ├── session/                # Layer 2: 短期记忆
+│   │   │   ├── models.py           # Session, SessionMeta
+│   │   │   ├── store.py            # SessionStore (Redis + PG)
+│   │   │   ├── lock.py             # SessionLock (分布式锁)
+│   │   │   └── metrics.py
+│   │   └── knowledge/              # Layer 3: 长期记忆 [Phase 2]
+│   │       ├── models.py           # MemoryEntry, SearchResult
+│   │       ├── store.py            # KnowledgeStore (pgvector)
+│   │       ├── search.py           # MemorySearch (混合搜索)
+│   │       ├── indexer.py          # MemoryIndexer
+│   │       ├── embedder.py         # Embedder ABC
+│   │       └── tools.py            # memory_search / memory_save
 │   │
-│   ├── context/                    # 上下文管理
+│   ├── context/                    # 上下文管理 (详见 CONTEXT-MANAGEMENT-DESIGN.md)
 │   │   ├── __init__.py
-│   │   ├── manager.py              # 四层防御协调器
-│   │   ├── truncator.py            # Layer 1: 输入截断
-│   │   ├── pruner.py               # Layer 2: 历史剪枝
-│   │   ├── compactor.py            # Layer 3: 自动压缩
-│   │   └── token_counter.py        # tiktoken 封装
+│   │   ├── manager.py              # ContextManager — 策略编排引擎
+│   │   ├── filtering.py            # Filtering: 规则过滤 (重复读取/探索命令)
+│   │   ├── compaction.py           # Compaction: 两阶段压实 (Soft/Hard)
+│   │   ├── eviction.py             # Eviction: 消息卸载到沙箱文件
+│   │   ├── summarization.py        # Summarization: LLM 摘要 [Phase 2]
+│   │   ├── overflow.py             # Emergency: 溢出处理 + 紧急截断
+│   │   ├── guard.py                # ContextWindowGuard [Phase 2]
+│   │   ├── context_files.py        # 上下文文件加载与压实
+│   │   ├── token_counter.py        # TokenCounter (tiktoken + 快速估算)
+│   │   ├── config.py               # ContextConfig
+│   │   └── metrics.py              # Prometheus 指标
 │   │
 │   ├── prompt/                     # 系统提示词
 │   │   ├── __init__.py
@@ -222,6 +266,17 @@ runtime/
 │   │   │   └── in_memory.py       # 测试/开发用
 │   │   ├── types.py                # 事件类型定义
 │   │   └── serializer.py           # Protobuf 序列化
+│   │
+│   ├── hooks/                      # Hook 系统 (生命周期钩子)
+│   │   ├── __init__.py
+│   │   ├── types.py               # HookName, HookMode, HookRegistration, HookContext
+│   │   ├── runner.py              # HookRunner 执行引擎
+│   │   ├── builtin.py             # 内置 hook handler (安全/审计/Metrics)
+│   │   ├── loader.py              # 扩展 Hook 加载器 (Phase 2)
+│   │   └── extensions/            # 扩展 hook 实现 (Phase 2+)
+│   │       ├── __init__.py
+│   │       ├── rag_injection.py   # RAG 上下文注入
+│   │       └── pii_redactor.py    # PII 脱敏
 │   │
 │   └── config.py                   # pydantic-settings 配置
 │
@@ -603,7 +658,7 @@ class Worker:
 | --- | --- |
 | 事件粒度控制 | 需要每个 text_delta 独立发射到 Event Bus，框架通常批量处理 |
 | 工具策略 | 9 层策略过滤 + 安全检查，框架的工具抽象太粗 |
-| 上下文管理 | 四层防御需要精确的 token 计数和消息操作 |
+| 上下文管理 | 四种策略 (卸载/压实/摘要/过滤) 需要精确的 token 计数和消息操作 |
 | Provider 切换 | 热切换 model/key，框架通常绑定单一 provider |
 | 可调试性 | 自建循环每一步都可日志/追踪，框架是黑盒 |
 
@@ -612,24 +667,33 @@ class Worker:
 ```text
 run_agent_loop(task_handle)
   │
+  ├── 0. 🪝 on_task_received (§13, fire-and-forget)
   ├── 1. 加载 Session 历史 (Redis → messages[])
   ├── 2. 解析模型 + 获取 API Key (Session 级亲和 §6.2)
   ├── 3. 分配沙箱容器
   ├── 4. 加载 + 过滤技能, 同步到沙箱 (§10)
   ├── 5. 创建工具集 + 策略过滤 (§7.6)
-  ├── 6. 构建系统提示词 (§8.4: 8 段落组装, tools+skills 都已就绪)
+  ├── 6. 构建系统提示词 (§8.4: 9 段落组装, tools+skills 都已就绪)
   ├── 7. 注入用户消息到 messages[]
+  ├── 7b.🪝 before_agent_loop (§13, 可注入上下文/修改提示词)
   ├── 8. 发射 RUN_START 事件 + 创建 ToolExecutor (§7.8)
   │
   ├── 9. ★ 交互循环 (max N 轮, 整体超时 5min):
   │   │
   │   ├── 9a. 上下文管理 (检查 token → 截断/剪枝/压缩)
-  │   ├── 9b. 调用 LLM (流式, 含重试)
+  │   ├── 9a'.🪝 before_llm_call (§13, 可修改 messages/system_prompt)
+  │   ├── 9b. 调用 LLM via FallbackRunner (§6.8, 四层容错):
+  │   │       ├── 第一层: 同 Key 重试 (429/5xx/超时)
+  │   │       ├── 第二层: Key 轮转 (401/403/402)
+  │   │       ├── 第三层: 上下文压缩 / Thinking 降级
+  │   │       ├── 第四层: 模型降级链 (换 Model)
   │   │       ├── 每个 text_delta → 发射 DELTA 事件
   │   │       ├── thinking_delta → 发射 THINKING 事件
   │   │       └── 完整响应 → messages.append(assistant)
+  │   ├── 9b'.🪝 after_llm_response (§13, 可观察/修改响应)
   │   ├── 9c. stop_reason == "end_turn" → 跳出循环
   │   ├── 9d. stop_reason == "tool_use" → ToolExecutor 执行:
+  │   │       ├── 🪝 before_tool_execute (§13, 可修改参数/拦截)
   │   │       ├── 查找工具 → 安全检查 → 是否需要确认?
   │   │       ├── 需要确认 → 人机交互挂起 (§4.4):
   │   │       │       ├── 发射 INPUT_REQUIRED 事件
@@ -643,12 +707,15 @@ run_agent_loop(task_handle)
   │   │       │       ├── 执行工具 (沙箱 exec / 文件 read/write)
   │   │       │       ├── 输出截断 (§7.9) + 发射 TOOL_RESULT 事件
   │   │       │       └── 封装 tool_result (§7.10)
+  │   │       ├── 🪝 after_tool_execute (§13, 可修改结果/脱敏)
   │   │       └── messages.append(tool_result) → 继续循环
   │   └── 9e. 异常处理 (API 错误 → 重试/降级/中止)
   │
   ├── 10. 发射 RUN_COMPLETE 事件
+  ├── 10b.🪝 before_session_save (§13, 可脱敏/过滤)
   ├── 11. 持久化 Session (messages[] → Redis + PG)
-  └── 12. 释放沙箱容器
+  ├── 12. 释放沙箱容器
+  └── 13. 🪝 on_task_complete (§13, fire-and-forget)
 ```
 
 ### 4.3 核心实现
@@ -1172,11 +1239,10 @@ class EventBackend(ABC):
         ...
 
 
-class EventPublishError(Exception):
-    """事件发布失败。"""
+class EventPublishError(SaharaRuntimeError):
+    """事件发布失败。继承统一错误基类 (§16.10)。"""
     def __init__(self, message: str, retryable: bool = True):
-        super().__init__(message)
-        self.retryable = retryable
+        super().__init__(message, retryable=retryable)
 ```
 
 ### 5.3 RunEmitter — 面向 Agent Loop 的统一接口
@@ -1568,7 +1634,10 @@ def _create_single_backend(name: str, config: "RuntimeConfig") -> EventBackend:
 | `RUN_ERROR` | 执行出错 | 推送 + 清除亲和 | 显示错误信息 |
 | `RUN_ABORT` | 任务被取消 | 推送 + 清除亲和 | 显示取消状态 |
 
-> **待同步**：`INPUT_REQUIRED` 和 `TOOL_CONFIRM_REQUIRED` 事件类型需要同步添加到 [gRPC 协议设计](./GRPC-PROTOCOL-DESIGN.md) 的 `EventType` 枚举和 [Event Bus 架构设计](./EVENT-BUS-DESIGN.md) 的事件定义中。
+> **已同步**：`INPUT_REQUIRED`、`TOOL_CONFIRM_REQUIRED` 和 `MODEL_FALLBACK` 事件类型已同步到：
+> - [gRPC 协议设计](./GRPC-PROTOCOL-DESIGN.md) — `EventType` 枚举（§7.2）+ `SendInput` RPC（§5.4）+ Sticky Affinity（§10.5）
+> - [异步事件传输协议](./EVENT-BUS-DESIGN.md) — AgentEvent payload（§3.3）+ 消费处理逻辑（§5.4）+ 事件速查表（附录 A）
+> - [WebSocket 协议设计](./WS-PROTOCOL-DESIGN.md) — `agent.input` RPC（§6.4）+ 3 个新事件定义（§7.3）+ 人机交互时序图（§8）
 
 ### 5.8 弹性设计
 
@@ -1775,7 +1844,9 @@ class ModelConfig:
     max_tokens: int           # 8192
     max_context_tokens: int   # 200000
     max_iterations: int       # 20
-    fallback: str | None      # 降级模型名
+    thinking_level: str | None = None  # "high" / "medium" / "low" / None
+    # 降级链配置 (详见 §6.8)
+    fallback_chain: "FallbackChainConfig | None" = None
 
 @dataclass
 class SessionModelBinding:
@@ -1857,20 +1928,22 @@ class ModelRouter:
     async def fallback(self, current: ModelConfig, session_key: str) -> ModelConfig:
         """模型降级: 主模型不可恢复时切换到备用。
         注意: 降级会丢失缓存, 仅在不可恢复错误时触发。
+        
+        完整的多层容错逻辑见 §6.8 FallbackRunner。
+        此方法仅处理 session binding 层面的模型切换。
         """
-        if not current.fallback:
+        if not current.fallback_chain or not current.fallback_chain.fallbacks:
             raise ModelUnavailableError("no fallback model configured")
 
         # 解绑旧的 session binding
         self.release_session(session_key)
         logger.warning("session_model_fallback",
                        session_key=session_key,
-                       from_model=current.model_id,
-                       to_model=current.fallback)
+                       from_model=current.model_id)
 
-        # 创建新绑定 (新模型, 新 Key)
+        # 创建新绑定 (新模型, 新 Key) — 由 FallbackRunner 协调
         return await self.resolve_for_session(
-            agent_id="__fallback__",  # 直接用 fallback model
+            model_id=None,  # 由 FallbackRunner 指定
             session_key=session_key,
         )
 
@@ -2039,6 +2112,702 @@ Session 绑定的创建与销毁:
 
 > **注意**：`_session_bindings` 是 Worker 内存中的缓存。由于 Gateway Dispatcher 的 Session 亲和策略（§7.2 in Gateway 文档），同一 session 的请求会尽量路由到同一 Worker，因此这个内存缓存的命中率很高。即使偶尔路由到不同 Worker，仅需重新创建一个 binding（首次调用无缓存），不影响正确性。
 
+### 6.7 多 Provider 消息格式适配
+
+Anthropic 和 OpenAI 的 API 在消息格式、工具调用协议上存在差异。Model Router 通过 **Provider Adapter** 层屏蔽这些差异，使 Agent Loop 只处理统一的内部格式。
+
+```text
+消息格式差异:
+
+  ┌─── Anthropic ──────────────────────┬─── OpenAI ──────────────────────────┐
+  │  system: 独立参数 (不在 messages)   │  system: messages[0].role="system" │
+  │  tools: 顶层 tools 参数             │  tools: 顶层 tools 参数 (类似)      │
+  │  tool_result 在 user 消息中:        │  tool 结果是独立角色:               │
+  │    role: "user"                     │    role: "tool"                     │
+  │    content: [{type:"tool_result"}]  │    tool_call_id: "..."              │
+  │  stop_reason: "tool_use"            │  finish_reason: "tool_calls"        │
+  │  tool_use 在 assistant content 中   │  tool_calls 在 message 顶层         │
+  └─────────────────────────────────────┴─────────────────────────────────────┘
+```
+
+```python
+# sahara_runtime/models/providers.py
+
+class ProviderAdapter(ABC):
+    """Provider 适配器。屏蔽 Anthropic/OpenAI API 差异。"""
+
+    @abstractmethod
+    async def create_stream(self, model: str, system: str,
+                            messages: list[dict], tools: list[dict],
+                            max_tokens: int) -> AsyncIterator:
+        """创建流式请求。"""
+        ...
+
+    @abstractmethod
+    def normalize_response(self, raw_response) -> "NormalizedResponse":
+        """将 Provider 原始响应转换为统一内部格式。"""
+        ...
+
+    @abstractmethod
+    def format_tool_result(self, tool_call_id: str, content: str,
+                           is_error: bool) -> dict:
+        """将工具结果格式化为 Provider 要求的消息格式。"""
+        ...
+
+
+class AnthropicAdapter(ProviderAdapter):
+    """Anthropic Claude API 适配。Phase 1 默认。"""
+    # system 作为独立参数; tool_result 在 user 消息中
+    ...
+
+class OpenAIAdapter(ProviderAdapter):
+    """OpenAI API 适配。Phase 2。"""
+    # system 作为 messages[0]; tool 结果用 role="tool"
+    ...
+```
+
+**设计原则**：Agent Loop 中的 `messages[]` 使用 **Anthropic 格式作为内部规范格式**（`tool_result` 在 `user` 消息中）。当 Provider 为 OpenAI 时，`OpenAIAdapter` 在发送请求前将格式转换为 OpenAI 格式，接收响应后再转回内部格式。Session Store 始终保存内部规范格式。
+
+> **Phase 1 简化**：Phase 1 仅支持 Anthropic，不需要 Adapter 层。Phase 2 引入 OpenAI 时实现 `ProviderAdapter` 抽象和 `OpenAIAdapter`。
+
+### 6.8 Fallback 系统 (多层容错)
+
+> LLM API 调用面临多种失败场景（429 限流、401 认证失效、402 计费耗尽、上下文溢出、超时等）。
+> Fallback 系统通过**四层递进防线**自动恢复，最大化请求成功率。
+>
+> 设计参考 OpenClaw 的四层容错体系，但针对 Sahara 的 Session 级缓存亲和（§6.2）做了关键适配——
+> **在任何降级操作之前，都优先评估缓存损失代价。**
+
+#### 6.8.1 四层防线架构
+
+```text
+LLM 调用失败
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  第一层: 同 Key 同 Model 重试 (保护缓存)                                     │
+│                                                                             │
+│  429 Rate Limit → 等待 retry-after → 重试 (缓存完整保留)                    │
+│  5xx Server     → 指数退避 (2s→4s→8s) → 重试 (缓存完整保留)                │
+│  超时           → 重试一次 → 缓存完整保留                                    │
+│  流中断         → 重试一次 → 缓存完整保留                                    │
+│                                                                             │
+│  ★ 关键: 绝不切换 Key, 绝不切换模型 → Prompt Cache 命中率最高               │
+│  ★ 与 §6.4 的 429 重试策略一致                                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  第二层: Key 轮转 (同 Model, 换 Key) — 缓存丢失                              │
+│                                                                             │
+│  401/403 认证失效 → 标记 Key 熔断 → 切换到下一个健康 Key → 重试             │
+│  402 计费耗尽   → 标记 Key 长期禁用 → 切换 Key → 重试                       │
+│                                                                             │
+│  ★ 丢失 Prompt Cache (Key 变了), 但保持同一模型能力                         │
+│  ★ 所有 Key 耗尽 → 触发第四层                                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  第三层: 上下文溢出恢复 + Thinking 级别降级                                   │
+│                                                                             │
+│  上下文溢出 → 调用 ContextManager 压缩 (§11) → 重试 (仅一次)               │
+│  Thinking 不支持 → 降级 thinking 级别 → 重试                                │
+│                                                                             │
+│  ★ 可能保留缓存 (如果压缩后前缀仍匹配)                                      │
+│  ★ 压缩后仍溢出 → 返回错误给用户 (单条消息本身超限, 无法恢复)              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  第四层: 模型降级链 (换 Model + 换 Key) — 最后手段                            │
+│                                                                             │
+│  主模型所有 Key 耗尽 / Provider 全局故障 → 切换到降级链下一个模型            │
+│                                                                             │
+│  claude-sonnet ──失败──→ gpt-4o ──失败──→ claude-haiku ──失败──→ RUN_ERROR │
+│       (首选)              (备选 1)           (最低保障)                       │
+│                                                                             │
+│  ★ 每次切换模型: Key 候选列表重建, 第一/二层从头开始                         │
+│  ★ 跳过所有 Key 都在冷却中的模型                                             │
+│  ★ 缓存完全丢失 (模型 + Key 都变了)                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**设计原则**：层级越深，缓存损失越大、恢复代价越高。系统始终从第一层开始尝试，穷尽当前层的恢复手段后才进入下一层。
+
+#### 6.8.2 错误分类 — FailoverReason
+
+所有 LLM 调用错误必须先分类，分类结果驱动恢复路径：
+
+```python
+# sahara_runtime/models/failover.py
+
+from enum import Enum
+
+class FailoverReason(str, Enum):
+    """LLM 调用失败的分类原因。驱动第几层防线响应。"""
+    RATE_LIMIT = "rate_limit"             # 429 → 第一层: 等待重试
+    SERVER_ERROR = "server_error"         # 5xx → 第一层: 退避重试
+    TIMEOUT = "timeout"                   # 超时 → 第一层: 重试一次
+    STREAM_INTERRUPTED = "stream_interrupted"  # 流中断 → 第一层: 重试
+    AUTH_FAILED = "auth_failed"           # 401/403 → 第二层: Key 轮转
+    BILLING_EXHAUSTED = "billing_exhausted"   # 402 → 第二层: Key 禁用
+    CONTEXT_OVERFLOW = "context_overflow" # 上下文溢出 → 第三层: 压缩
+    THINKING_UNSUPPORTED = "thinking_unsupported"  # → 第三层: 降级 thinking
+    FORMAT_ERROR = "format_error"         # 协议格式错误 → 第四层: 换模型
+    PROVIDER_UNAVAILABLE = "provider_unavailable"  # 全局故障 → 第四层: 换模型
+    UNKNOWN = "unknown"                   # 未知 → 不重试, 直接失败
+
+
+# ── 分类优先级: 先 HTTP 状态码, 再错误消息文本匹配 ──
+
+def classify_failover_reason(error: Exception) -> FailoverReason:
+    """将 LLM 调用异常分类为 FailoverReason。
+    
+    分类顺序:
+    1. HTTP 状态码 (最可靠)
+    2. 错误代码 (ETIMEDOUT, ECONNRESET 等)
+    3. 错误消息文本模式匹配 (兜底)
+    """
+    status = getattr(error, "status_code", 0)
+    message = str(error).lower()
+
+    # ── 1. HTTP 状态码 ──
+    if status == 429:
+        return FailoverReason.RATE_LIMIT
+    if status == 401 or status == 403:
+        return FailoverReason.AUTH_FAILED
+    if status == 402:
+        return FailoverReason.BILLING_EXHAUSTED
+    if status == 408:
+        return FailoverReason.TIMEOUT
+    if status >= 500:
+        return FailoverReason.SERVER_ERROR
+
+    # ── 2. 错误消息模式 ──
+    if any(p in message for p in ["rate limit", "too many requests", "quota exceeded"]):
+        return FailoverReason.RATE_LIMIT
+    if any(p in message for p in ["context", "too long", "max.*token", "prompt is too long"]):
+        return FailoverReason.CONTEXT_OVERFLOW
+    if any(p in message for p in ["thinking", "not supported", "supported values"]):
+        return FailoverReason.THINKING_UNSUPPORTED
+    if any(p in message for p in ["timeout", "timed out", "deadline exceeded"]):
+        return FailoverReason.TIMEOUT
+    if any(p in message for p in ["unauthorized", "invalid api key", "forbidden"]):
+        return FailoverReason.AUTH_FAILED
+    if any(p in message for p in ["payment required", "insufficient credits"]):
+        return FailoverReason.BILLING_EXHAUSTED
+    if any(p in message for p in ["invalid request format", "tool_use.id"]):
+        return FailoverReason.FORMAT_ERROR
+    if any(p in message for p in ["connection", "reset", "refused", "unreachable"]):
+        return FailoverReason.PROVIDER_UNAVAILABLE
+
+    return FailoverReason.UNKNOWN
+```
+
+**分类如何驱动行为**：
+
+```text
+classify_failover_reason(error)
+    │
+    ├── RATE_LIMIT / SERVER_ERROR / TIMEOUT / STREAM_INTERRUPTED
+    │   → 第一层: 同 Key 重试 (§6.4 现有策略)
+    │
+    ├── AUTH_FAILED / BILLING_EXHAUSTED
+    │   → 第二层: Key 轮转
+    │   → 标记冷却 (AUTH: 分钟级指数退避, BILLING: 小时级)
+    │
+    ├── CONTEXT_OVERFLOW
+    │   → 第三层: ContextManager 压缩 → 重试
+    │
+    ├── THINKING_UNSUPPORTED
+    │   → 第三层: 降级 thinking 级别 → 重试
+    │
+    ├── FORMAT_ERROR / PROVIDER_UNAVAILABLE
+    │   → 第四层: 直接模型降级 (Key 轮转无意义)
+    │
+    └── UNKNOWN
+        → 不重试, 直接 RUN_ERROR
+```
+
+#### 6.8.3 Key 冷却机制
+
+```python
+# sahara_runtime/models/key_pool.py — 扩展 §6.5 的 KeyPool
+
+class KeyState(str, Enum):
+    HEALTHY = "healthy"               # 正常可用
+    COOLING = "cooling"               # 冷却中 (429/超时), 短暂暂停
+    CIRCUIT_OPEN = "circuit_open"     # 熔断 (401/403), 需要探测
+    BILLING_DISABLED = "billing_disabled"  # 计费禁用 (402), 长期不可用
+
+
+@dataclass
+class KeyCooldown:
+    """Key 冷却状态。"""
+    key_id: str
+    state: KeyState
+    error_count: int = 0              # 失败窗口内累计错误数
+    last_error_at: float = 0.0        # 上次错误时间
+    cooldown_until: float = 0.0       # 冷却到期时间 (短期)
+    disabled_until: float = 0.0       # 禁用到期时间 (长期)
+    failure_window_hours: float = 24  # 失败计数窗口
+
+
+def calculate_cooldown(reason: FailoverReason, error_count: int) -> float:
+    """计算冷却时长 (秒)。
+
+    普通失败 (rate_limit / auth / timeout):
+      cooldown = min(3600, 60 × 5^(min(error_count - 1, 3)))
+      → 1min → 5min → 25min → 60min (上限)
+
+    计费失败 (billing):
+      disabled = min(24h, 5h × 2^(min(billing_count - 1, 3)))
+      → 5h → 10h → 20h → 24h (上限)
+    """
+    if reason == FailoverReason.BILLING_EXHAUSTED:
+        hours = min(24, 5 * (2 ** min(error_count - 1, 3)))
+        return hours * 3600
+    else:
+        seconds = min(3600, 60 * (5 ** min(error_count - 1, 3)))
+        return seconds
+```
+
+| 连续失败次数 | 普通失败冷却 | 计费失败禁用 |
+| --- | --- | --- |
+| 1 | 1 分钟 | 5 小时 |
+| 2 | 5 分钟 | 10 小时 |
+| 3 | 25 分钟 | 20 小时 |
+| 4+ | 60 分钟 (上限) | 24 小时 (上限) |
+
+**失败窗口**：如果距离上次错误超过 24 小时，错误计数重置为 0。
+
+#### 6.8.4 Fallback Chain 配置与解析
+
+```python
+# sahara_runtime/models/fallback.py
+
+@dataclass
+class FallbackChainConfig:
+    """模型降级链配置。"""
+    primary: str                          # 主模型: "anthropic/claude-sonnet-4-20250514"
+    fallbacks: list[str] = field(default_factory=list)  # 降级链
+    # 例: ["openai/gpt-4o", "anthropic/claude-3-haiku-20240307"]
+
+    max_retries_per_model: int = 3        # 每个模型的第一层重试次数
+    max_key_rotations_per_model: int = 3  # 每个模型的第二层 Key 轮转次数
+    enable_context_compression: bool = True   # 是否启用第三层上下文压缩
+    enable_thinking_fallback: bool = True     # 是否启用第三层 Thinking 降级
+
+    @property
+    def all_models(self) -> list[str]:
+        """完整模型候选列表 (主 + 降级)。"""
+        return [self.primary] + self.fallbacks
+
+
+@dataclass
+class FallbackState:
+    """运行时降级状态追踪 (per task)。"""
+    current_model_index: int = 0
+    current_key_rotation: int = 0
+    overflow_compressed: bool = False         # 本次任务是否已尝试压缩
+    attempted_thinking_levels: set = field(default_factory=set)
+    total_failover_count: int = 0             # 累计降级次数 (指标用)
+
+    @property
+    def is_degraded(self) -> bool:
+        """是否已从主模型降级。"""
+        return self.current_model_index > 0
+```
+
+**配置示例** (Runtime 配置或 Agent 配置):
+
+```yaml
+# 全局默认降级链
+model:
+  fallback_chain:
+    primary: "anthropic/claude-sonnet-4-20250514"
+    fallbacks:
+      - "openai/gpt-4o"
+      - "anthropic/claude-3-haiku-20240307"
+    max_retries_per_model: 3
+    max_key_rotations_per_model: 3
+
+# Agent 级覆盖 (可选)
+agents:
+  agent_001:
+    model:
+      fallback_chain:
+        primary: "anthropic/claude-sonnet-4-20250514"
+        fallbacks:
+          - "openai/gpt-4o-mini"   # 该 Agent 偏好低成本备选
+```
+
+#### 6.8.5 FallbackRunner — 核心执行引擎
+
+```python
+# sahara_runtime/models/fallback.py
+
+class FallbackRunner:
+    """Fallback 系统执行引擎。封装四层防线逻辑。
+    
+    被 Agent Loop 在每次 LLM 调用时使用, 替代直接的 client.messages.create()。
+    """
+
+    def __init__(self, model_router: ModelRouter, key_pool: KeyPool,
+                 context_manager: ContextManager,
+                 chain_config: FallbackChainConfig):
+        self.model_router = model_router
+        self.key_pool = key_pool
+        self.context_manager = context_manager
+        self.chain_config = chain_config
+
+    async def call_with_fallback(
+        self,
+        session_key: str,
+        system_prompt: str,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int,
+        thinking_level: str | None = None,
+        state: FallbackState | None = None,
+    ) -> "LLMResponse":
+        """带四层容错的 LLM 调用。
+
+        Args:
+            session_key: 会话标识 (维护缓存亲和)
+            system_prompt: 系统提示词
+            messages: 对话消息
+            tools: 工具定义
+            max_tokens: 最大输出 token
+            thinking_level: Thinking 级别 ("high" / "medium" / "low" / None)
+            state: 降级状态 (跨调用保持, 由 Agent Loop 管理)
+
+        Returns:
+            LLMResponse: LLM 响应
+
+        Raises:
+            LLMCallError: 所有恢复手段穷尽后仍失败
+        """
+        if state is None:
+            state = FallbackState()
+
+        models = self.chain_config.all_models
+
+        # ── 第四层: 模型降级链外层循环 ──
+        while state.current_model_index < len(models):
+            model_id = models[state.current_model_index]
+            provider = model_id.split("/")[0]
+
+            # 跳过所有 Key 都在冷却中的模型
+            if not await self.key_pool.has_any_available_key(provider):
+                logger.info("fallback_skip_model",
+                            model=model_id, reason="all_keys_cooling")
+                state.current_model_index += 1
+                state.current_key_rotation = 0
+                continue
+
+            try:
+                return await self._call_with_key_rotation(
+                    session_key=session_key,
+                    model_id=model_id,
+                    provider=provider,
+                    system_prompt=system_prompt,
+                    messages=messages,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    thinking_level=thinking_level,
+                    state=state,
+                )
+            except _FailoverSignal:
+                # 当前模型所有恢复手段穷尽 → 尝试下一个模型
+                logger.warning("fallback_model_switch",
+                               from_model=model_id,
+                               to_model=models[state.current_model_index + 1]
+                                   if state.current_model_index + 1 < len(models)
+                                   else "NONE",
+                               total_failovers=state.total_failover_count)
+                state.current_model_index += 1
+                state.current_key_rotation = 0
+                state.attempted_thinking_levels.clear()  # 新模型重置 Thinking
+                state.total_failover_count += 1
+
+                # 切换模型意味着切换 Provider/Key, 需要解绑 session
+                self.model_router.release_session(session_key)
+                continue
+
+        # 所有模型都失败
+        raise LLMCallError(
+            f"All models exhausted: {models}",
+            retryable=False,
+        )
+
+    async def _call_with_key_rotation(
+        self, session_key: str, model_id: str, provider: str,
+        system_prompt: str, messages: list[dict],
+        tools: list[dict], max_tokens: int,
+        thinking_level: str | None,
+        state: FallbackState,
+    ) -> "LLMResponse":
+        """第一~三层: 在同一模型内尝试所有恢复手段。"""
+
+        max_retries = self.chain_config.max_retries_per_model
+        max_rotations = self.chain_config.max_key_rotations_per_model
+
+        for attempt in range(max_retries):
+            try:
+                # 解析当前 session 绑定的 model + key
+                binding = await self.model_router.resolve_for_session(
+                    model_id=model_id, session_key=session_key,
+                )
+
+                response = await self._do_llm_call(
+                    binding=binding,
+                    system_prompt=system_prompt,
+                    messages=messages,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    thinking_level=thinking_level,
+                )
+                return response
+
+            except Exception as e:
+                reason = classify_failover_reason(e)
+
+                # ── 第一层: 同 Key 重试 ──
+                if reason in (FailoverReason.RATE_LIMIT,
+                              FailoverReason.SERVER_ERROR,
+                              FailoverReason.TIMEOUT,
+                              FailoverReason.STREAM_INTERRUPTED):
+                    wait = self._compute_retry_wait(reason, attempt, e)
+                    logger.info("fallback_layer1_retry",
+                                reason=reason.value, attempt=attempt,
+                                wait_s=wait, model=model_id)
+                    await asyncio.sleep(wait)
+                    continue
+
+                # ── 第二层: Key 轮转 ──
+                if reason in (FailoverReason.AUTH_FAILED,
+                              FailoverReason.BILLING_EXHAUSTED):
+                    await self.key_pool.report_error(
+                        binding.api_key, reason, state.current_key_rotation,
+                    )
+                    state.current_key_rotation += 1
+
+                    if state.current_key_rotation >= max_rotations:
+                        raise _FailoverSignal()  # 所有 Key 耗尽 → 第四层
+
+                    # 解绑当前 session, 下次循环会 resolve 新 Key
+                    self.model_router.release_session(session_key)
+                    logger.info("fallback_layer2_key_rotate",
+                                reason=reason.value,
+                                rotation=state.current_key_rotation,
+                                model=model_id)
+                    continue
+
+                # ── 第三层 A: 上下文溢出恢复 ──
+                if reason == FailoverReason.CONTEXT_OVERFLOW:
+                    if (self.chain_config.enable_context_compression
+                            and not state.overflow_compressed):
+                        state.overflow_compressed = True
+                        logger.info("fallback_layer3_compress", model=model_id)
+                        messages = await self.context_manager.emergency_compress(
+                            messages)
+                        continue  # 压缩后重试
+                    # 压缩后仍溢出或已压缩过 → 给用户报错
+                    raise LLMCallError(
+                        "Context overflow after compression",
+                        retryable=False,
+                    )
+
+                # ── 第三层 B: Thinking 级别降级 ──
+                if reason == FailoverReason.THINKING_UNSUPPORTED:
+                    if (self.chain_config.enable_thinking_fallback
+                            and thinking_level is not None):
+                        new_level = self._pick_fallback_thinking(
+                            str(e), state.attempted_thinking_levels,
+                        )
+                        if new_level:
+                            state.attempted_thinking_levels.add(thinking_level)
+                            thinking_level = new_level
+                            logger.info("fallback_layer3_thinking",
+                                        old=thinking_level, new=new_level,
+                                        model=model_id)
+                            continue
+                    raise _FailoverSignal()  # Thinking 无法降级 → 第四层
+
+                # ── FORMAT_ERROR / PROVIDER_UNAVAILABLE → 直接第四层 ──
+                if reason in (FailoverReason.FORMAT_ERROR,
+                              FailoverReason.PROVIDER_UNAVAILABLE):
+                    raise _FailoverSignal()
+
+                # ── UNKNOWN → 不可恢复 ──
+                raise LLMCallError(str(e), retryable=False)
+
+        # 重试次数用尽
+        raise _FailoverSignal()
+
+    def _compute_retry_wait(self, reason: FailoverReason,
+                            attempt: int, error: Exception) -> float:
+        """计算第一层重试等待时间。"""
+        if reason == FailoverReason.RATE_LIMIT:
+            # 优先使用 Provider 返回的 retry-after
+            retry_after = getattr(error, "retry_after", None)
+            if retry_after:
+                return min(float(retry_after), 30.0)
+            return min(2 ** attempt * 2, 30.0)
+        elif reason == FailoverReason.SERVER_ERROR:
+            return 2 ** attempt  # 2s → 4s → 8s
+        else:
+            return 2.0  # 超时/流中断: 固定 2s
+
+    def _pick_fallback_thinking(self, error_message: str,
+                                attempted: set) -> str | None:
+        """从错误消息中解析支持的 Thinking 级别, 返回一个未尝试过的。
+        
+        例: "thinking level 'high' not supported, supported values: low, medium"
+        → 解析出 ["low", "medium"], 排除已尝试的, 返回第一个。
+        """
+        import re
+        match = re.search(r"supported values[:\s]+([a-z, ]+)", error_message.lower())
+        if not match:
+            return None
+        supported = [s.strip() for s in match.group(1).split(",")]
+        for level in supported:
+            if level and level not in attempted:
+                return level
+        return None
+
+
+class _FailoverSignal(Exception):
+    """内部信号: 当前模型所有恢复手段穷尽, 触发模型降级。"""
+    pass
+```
+
+#### 6.8.6 与 Agent Loop 的集成
+
+```python
+# sahara_runtime/agent_loop.py — Fallback 集成 (概要)
+
+async def run_agent_loop(deps: Dependencies, task_handle, ...):
+    # ... 步骤 1-8: 准备阶段 ...
+
+    # ── 初始化 Fallback ──
+    fallback_chain = deps.config.get_fallback_chain(agent_id)
+    fallback_runner = FallbackRunner(
+        model_router=deps.model_router,
+        key_pool=deps.key_pool,
+        context_manager=deps.context_manager,
+        chain_config=fallback_chain,
+    )
+    fallback_state = FallbackState()  # 贯穿整个任务生命周期
+
+    # ── 交互循环 ──
+    for round_num in range(1, max_rounds + 1):
+
+        # 上下文管理 (§11)
+        messages = await deps.context_manager.fit(messages, ...)
+
+        # ★ 使用 FallbackRunner 替代直接的 LLM 调用
+        try:
+            response = await fallback_runner.call_with_fallback(
+                session_key=session_key,
+                system_prompt=system_prompt,
+                messages=messages,
+                tools=tool_definitions,
+                max_tokens=max_tokens,
+                thinking_level=thinking_level,
+                state=fallback_state,  # 跨轮次保持降级状态
+            )
+        except LLMCallError as e:
+            # 所有模型+所有Key都失败 → 任务终止
+            await emitter.emit_run_error(error=str(e))
+            return
+
+        # 如果发生了降级, 记录到事件
+        if fallback_state.is_degraded:
+            await emitter.emit_model_fallback(
+                from_model=fallback_chain.primary,
+                to_model=fallback_chain.all_models[fallback_state.current_model_index],
+            )
+
+        # ... 处理 response (工具调用 / end_turn) ...
+```
+
+#### 6.8.7 Fallback 时序图
+
+```text
+Agent Loop                FallbackRunner          KeyPool         ContextManager
+    │                          │                     │                  │
+    ├── call_with_fallback() ──▶                     │                  │
+    │                          │                     │                  │
+    │                    ┌─────┤ 模型 1: claude-sonnet│                  │
+    │                    │     │                     │                  │
+    │                    │  LLM call ──────────────────→ [Anthropic API]
+    │                    │     │ 429 Rate Limit ◀────┤                  │
+    │                    │     │                     │                  │
+    │                    │  第一层: sleep(retry-after)│                  │
+    │                    │     │                     │                  │
+    │                    │  LLM call (重试) ───────────→ [Anthropic API]
+    │                    │     │ 401 Auth Failed ◀───┤                  │
+    │                    │     │                     │                  │
+    │                    │  第二层: report_error() ──▶│ mark circuit_open│
+    │                    │     │         release_session()              │
+    │                    │     │                     │                  │
+    │                    │  LLM call (新 Key) ─────────→ [Anthropic API]
+    │                    │     │ 上下文溢出 ◀────────┤                  │
+    │                    │     │                     │                  │
+    │                    │  第三层: ─────────────────────────▶ compress()
+    │                    │     │                     │        ◀─────────┤
+    │                    │     │                     │                  │
+    │                    │  LLM call (压缩后) ─────────→ [Anthropic API]
+    │                    │     │ 仍然失败 ◀──────────┤                  │
+    │                    └─────┤                     │                  │
+    │                          │                     │                  │
+    │                    ┌─────┤ 模型 2: gpt-4o      │                  │
+    │                    │     │                     │                  │
+    │                    │  第四层: 模型降级           │                  │
+    │                    │  重新 resolve (新 Provider + 新 Key)         │
+    │                    │     │                     │                  │
+    │                    │  LLM call ──────────────────→ [OpenAI API]
+    │                    │     │ 成功! ◀─────────────┤                  │
+    │                    └─────┤                     │                  │
+    │                          │                     │                  │
+    │ ◀── LLMResponse ────────┤                     │                  │
+```
+
+#### 6.8.8 与 Hook 系统的交互
+
+Fallback 系统在关键节点触发 Hook（§13），支持外部监控和扩展：
+
+| 事件点 | Hook | 用途 |
+| --- | --- | --- |
+| Key 轮转 | `after_llm_response` | 监控 Key 失败频率 |
+| 模型降级 | `after_llm_response` | 告警通知、降级审计 |
+| 上下文压缩 | `before_llm_call` | 压缩前后的 messages 对比分析 |
+| Thinking 降级 | `before_llm_call` | 记录 Thinking 级别变化 |
+
+#### 6.8.9 可观测性
+
+```python
+# Prometheus 指标 (详见 OBSERVABILITY-DESIGN.md)
+
+sahara_rt_fallback_layer_triggered_total    # counter: layer={1|2|3|4}, reason={FailoverReason}
+sahara_rt_fallback_model_switch_total       # counter: from_model, to_model
+sahara_rt_fallback_key_rotation_total       # counter: provider, reason
+sahara_rt_fallback_context_compress_total   # counter: result={success|still_overflow}
+sahara_rt_fallback_thinking_downgrade_total # counter: from_level, to_level
+sahara_rt_key_cooldown_active              # gauge: provider, state={cooling|circuit_open|billing_disabled}
+```
+
+```python
+# structlog 日志示例
+{"event": "fallback_layer1_retry",   "reason": "rate_limit",  "attempt": 1, "wait_s": 2.0, "model": "claude-sonnet"}
+{"event": "fallback_layer2_key_rotate", "reason": "auth_failed", "rotation": 1, "model": "claude-sonnet"}
+{"event": "fallback_layer3_compress", "model": "claude-sonnet"}
+{"event": "fallback_model_switch",   "from_model": "claude-sonnet", "to_model": "gpt-4o", "total_failovers": 1}
+```
+
+#### 6.8.10 Phase 规划
+
+| Phase | 范围 | 说明 |
+| --- | --- | --- |
+| **Phase 1** | 第一层 (同 Key 重试) + 第二层 (Key 轮转) + 错误分类 + Key 冷却 | 单 Provider (Anthropic), 无模型降级 |
+| **Phase 1.5** | + 第三层 A (上下文压缩恢复) | 依赖 ContextManager §11 |
+| **Phase 2** | + 第四层 (模型降级链) + 第三层 B (Thinking 降级) + 多 Provider | 需要 ProviderAdapter §6.7 |
+| **Phase 3** | + 按 Agent 配置降级链 + 降级 Dashboard + 自动告警 | 细化降级策略 |
+
 ---
 
 ## 七、工具系统 (Tools)
@@ -2181,52 +2950,7 @@ Session 绑定的创建与销毁:
   └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 工具接口
-
-```python
-# sahara_runtime/tools/base.py
-
-class Tool(ABC):
-    """所有工具的基类。"""
-
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """工具唯一标识, 也是 LLM 调用时使用的名称。"""
-        ...
-
-    @property
-    @abstractmethod
-    def description(self) -> str:
-        """工具描述, LLM 根据此描述决定是否调用。
-        描述质量直接影响 LLM 的工具选择准确率。
-        """
-        ...
-
-    @abstractmethod
-    def parameters_schema(self) -> dict:
-        """JSON Schema 格式的参数定义。LLM 按此 Schema 生成调用参数。"""
-        ...
-
-    @abstractmethod
-    async def execute(self, args: dict, sandbox: Sandbox | None = None) -> str:
-        """执行工具, 返回字符串结果。
-        所有结果统一为字符串 — LLM 只理解文本。
-        """
-        ...
-
-    def to_llm_schema(self) -> dict:
-        """转换为 LLM API 格式的工具定义 (Anthropic Tool Use 协议)。
-        此 dict 直接传入 client.messages.create(tools=[...])。
-        """
-        return {
-            "name": self.name,
-            "description": self.description,
-            "input_schema": self.parameters_schema(),
-        }
-```
-
-### 7.3 工具优先级与分层
+### 7.2 工具接口与优先级分层
 
 工具集内部有明确的**优先级分层**，影响三个维度：
 
@@ -3144,7 +3868,10 @@ def _validate_path(path: str) -> str:
   │  │  § 段落 7: 用户自定义指令 (Custom Instructions)     [每 Agent]│ │
   │  │  "<custom_instructions>...</custom_instructions>"             │ │
   │  ├───────────────────────────────────────────────────────────────┤ │
-  │  │  § 段落 8: 运行时信息 (Runtime Info)                [每次变]  │ │
+  │  │  § 段落 8: 记忆召回 (Memory Recall)    [Phase 2] [每次变]    │ │
+  │  │  "<memory_recall>跨会话相关记忆...</memory_recall>"          │ │
+  │  ├───────────────────────────────────────────────────────────────┤ │
+  │  │  § 段落 9: 运行时信息 (Runtime Info)                [每次变]  │ │
   │  │  "<runtime_info>日期、用户、会话元数据</runtime_info>"        │ │
   │  └───────────────────────────────────────────────────────────────┘ │
   │                                                                     │
@@ -3153,6 +3880,9 @@ def _validate_path(path: str) -> str:
 ```
 
 ### 8.3 各段落详解
+
+> **段落 1-7、9**: 见下方各段落详解。
+> **段落 8: 记忆召回 (Memory Recall)** [Phase 2]：当 Agent Memory 的长期记忆（§12.3 Knowledge Store）启用后，`PromptBuilder` 在构建系统提示词时会调用 `MemorySearch`，将与当前任务语义相关的跨会话记忆注入到 `<memory_recall>` 段落中。此段落排在自定义指令之后、运行时信息之前——它是动态内容，对 Prompt Cache 影响可控（仅最后两个段落变化）。详见 [AGENT-MEMORY-DESIGN.md](./AGENT-MEMORY-DESIGN.md)。
 
 #### 段落 1: 身份与角色 (Identity)
 
@@ -3754,7 +4484,7 @@ class PromptBuilder:
 ### 8.5 构建流程时序图
 
 ```text
-Agent Loop 步骤 4 — 构建系统提示词:
+Agent Loop 步骤 6 — 构建系统提示词:
 
   run_agent_loop()
        │
@@ -3798,7 +4528,7 @@ Agent Loop 步骤 4 — 构建系统提示词:
 ### 8.6 与 Agent Loop 的集成
 
 ```python
-# sahara_runtime/agent_loop.py — 步骤 4 (更新后)
+# sahara_runtime/agent_loop.py — 步骤 4-6 (准备阶段)
 
 async def run_agent_loop(deps, task_handle, ...):
     ...
@@ -3806,7 +4536,7 @@ async def run_agent_loop(deps, task_handle, ...):
     # ── 3. 沙箱分配 ──
     sandbox = await deps.sandbox_manager.acquire(session_key)
 
-    # ── 4a. 加载 + 过滤技能 ──
+    # ── 4. 加载 + 过滤技能 ──
     all_skills = await deps.skill_loader.load_all()
     filtered_skills = deps.skill_filter.filter(all_skills, deps.config)
 
@@ -3820,7 +4550,7 @@ async def run_agent_loop(deps, task_handle, ...):
     )
     tool_definitions = [t.to_llm_schema() for t in tools]
 
-    # ── 4c. 构建系统提示词 (需要 tools + skills 都准备好) ──
+    # ── 6. 构建系统提示词 (需要 tools + skills 都准备好) ──
     system_prompt = await deps.prompt_builder.build(
         agent_config=agent_config,
         tools=tools,                  # → 段落 3: 工具指南
@@ -3831,10 +4561,10 @@ async def run_agent_loop(deps, task_handle, ...):
         user_prefs=user_prefs,
     )
 
-    # ── 6. 注入用户消息 ──
+    # ── 7. 注入用户消息 ──
     messages.append({"role": "user", "content": user_message})
 
-    # ── 7. RUN_START + 工具执行器 ──
+    # ── 8. RUN_START + 工具执行器 ──
     ...
 ```
 
@@ -3999,7 +4729,7 @@ Workspace: /workspace
 | Phase | 范围 | 说明 |
 | --- | --- | --- |
 | **Phase 1** | ★ 基础版 PromptBuilder: 身份 + 安全 + 工具指南 + 运行时信息 | 4 个段落, 无缓存, 无预算控制 |
-| **Phase 2** | + 技能段落 + 沙箱段落 + 上下文文件 + 自定义指令 | 完整 8 段落, Redis 段落缓存 |
+| **Phase 2** | + 技能段落 + 沙箱段落 + 上下文文件 + 自定义指令 + **记忆召回段落** | 完整 9 段落, Redis 段落缓存 |
 | **Phase 3** | + 预算控制 + 段落 A/B 测试 + 提示词效果度量 | 根据工具选择准确率优化段落措辞 |
 
 ---
@@ -4176,10 +4906,10 @@ class Sandbox(ABC):
         ...
 
 
-# ── 统一异常体系 ──
+# ── 统一异常体系 (继承自 §16.10 SaharaRuntimeError) ──
 
-class SandboxError(Exception):
-    """沙箱操作基础异常。"""
+class SandboxError(SaharaRuntimeError):
+    """沙箱操作基础异常。继承统一错误基类, 支持 retryable 标记。"""
     pass
 
 class SandboxTimeoutError(SandboxError):
@@ -4200,7 +4930,8 @@ class SandboxQuotaError(SandboxError):
 
 class SandboxUnavailableError(SandboxError):
     """沙箱不可用 (容器崩溃、VM 异常等)。"""
-    pass
+    def __init__(self, message: str):
+        super().__init__(message, retryable=True)
 ```
 
 ### 9.3 SandboxManager 抽象接口
@@ -4680,10 +5411,9 @@ Skills 在 Agent Loop 中的位置:
 class SkillTier(IntEnum):
     """技能优先级层级。数值越小优先级越高。"""
     BUILTIN = 0       # 内置技能: 随 Runtime 发布
-    CURATED = 1       # 精选技能: 平台官方审核推荐
+    CONFIGURED = 1    # 业务配置技能: 按业务需求配置启用的技能
     MANAGED = 2       # 托管技能: 平台市场安装
-    WORKSPACE = 3     # 工作空间技能: Agent/用户本地
-    USER = 4          # 用户自定义: 用户上传
+    USER = 3          # 用户自定义: 用户上传
 
 @dataclass
 class SkillMetadata:
@@ -4694,7 +5424,7 @@ class SkillMetadata:
     emoji: str | None = None
     homepage: str | None = None
     os: list[str] | None = None      # 支持的操作系统 ["linux", "darwin"]
-    tier: SkillTier = SkillTier.WORKSPACE  # 优先级层级
+    tier: SkillTier = SkillTier.MANAGED    # 优先级层级
     priority: int = 100              # 同 Tier 内的排序权重 (越小越靠前)
     tags: list[str] | None = None    # 分类标签, 如 ["devops", "deploy"]
     requires: SkillRequirements | None = None
@@ -4727,7 +5457,7 @@ class SkillEntry:
     description: str
     base_dir: str                  # SKILL.md 所在目录
     file_path: str                 # SKILL.md 完整路径
-    source: str = "bundled"        # 来源: "bundled" / "managed" / "workspace"
+    source: str = "bundled"        # 来源: "bundled" / "configured" / "managed"
     metadata: SkillMetadata | None = None
     invocation: InvocationPolicy | None = None
 
@@ -4736,10 +5466,10 @@ class SkillEntry:
         """有效 Tier, 来源覆盖 + SKILL.md 声明取其低。"""
         source_tier = {
             "bundled": SkillTier.BUILTIN,
+            "configured": SkillTier.CONFIGURED,
             "managed": SkillTier.MANAGED,
-            "workspace": SkillTier.WORKSPACE,
         }.get(self.source, SkillTier.USER)
-        declared_tier = self.metadata.tier if self.metadata else SkillTier.WORKSPACE
+        declared_tier = self.metadata.tier if self.metadata else SkillTier.MANAGED
         return min(source_tier, declared_tier)
 
     @property
@@ -4760,15 +5490,17 @@ class SkillEntry:
   │  Tier 0: 内置技能 (Builtin)                                   │
   │  随 Runtime 发布, 经过充分测试, 始终排在最前                   │
   │                                                               │
-  │  create-rule     — 创建 Cursor/Agent 规则文件                 │
+  │  create-rule     — 创建 Agent 规则文件                        │
   │  create-skill    — 创建新技能                                 │
   │                                                               │
   ├───────────────────────────────────────────────────────────────┤
-  │  Tier 1: 精选技能 (Curated)                      [Phase 2]    │
-  │  平台官方审核推荐, 质量有保证                                  │
+  │  Tier 1: 业务配置技能 (Configured)                 [Phase 2]   │
+  │  按业务需求配置启用, 由运营/业务团队管理                       │
+  │  通过平台后台为特定 Agent/场景配置所需技能                     │
   │                                                               │
   │  deploy-k8s     — K8s 部署                                    │
   │  setup-ci       — CI/CD 配置                                  │
+  │  code-review    — 代码审查规范                                │
   │                                                               │
   ├───────────────────────────────────────────────────────────────┤
   │  Tier 2: 托管技能 (Managed)                      [Phase 2]    │
@@ -4778,21 +5510,14 @@ class SkillEntry:
   │  translate       — 翻译                                       │
   │                                                               │
   ├───────────────────────────────────────────────────────────────┤
-  │  Tier 3: 工作空间技能 (Workspace)                              │
-  │  Agent 或项目本地技能, 开发者自行维护                          │
-  │                                                               │
-  │  my-deploy       — 项目专属部署脚本                           │
-  │  code-review     — 团队代码审查规范                           │
-  │                                                               │
-  ├───────────────────────────────────────────────────────────────┤
-  │  Tier 4: 用户自定义 (User)                       [Phase 3]    │
+  │  Tier 3: 用户自定义 (User)                       [Phase 3]    │
   │  用户上传, 最低优先级, 需要安全审核                            │
   │                                                               │
   └───────────────────────────────────────────────────────────────┘
 
   <available_skills> 中的排列顺序:
-  [create-rule, create-skill, deploy-k8s, weather, my-deploy, ...]
-   ├─ Tier 0 ───────────┤├─ Tier 1 ──┤├ Tier 2 ┤├ Tier 3 ──────┤
+  [create-rule, create-skill, deploy-k8s, weather, translate, ...]
+   ├─ Tier 0 ───────────┤├─ Tier 1 ──────┤├─ Tier 2 ─────────┤
 ```
 
 **同 Tier 内的排序：** 由 `priority` 字段决定（默认 100，越小越靠前）。同 `priority` 按名称字母序。
@@ -4803,7 +5528,7 @@ class SkillEntry:
 name: deploy-k8s
 description: Deploy to Kubernetes cluster.
 metadata:
-  tier: 1          # Tier 1: Curated
+  tier: 1          # Tier 1: Configured (业务配置)
   priority: 10     # 同 Tier 内排在较前
   tags: ["devops", "deploy", "kubernetes"]
   requires:
@@ -4829,10 +5554,10 @@ def sort_skills(entries: list[SkillEntry]) -> list[SkillEntry]:
 | --- | --- | --- |
 | **`<available_skills>` 排列** | 排在前面, LLM 更易匹配 | 排在后面 |
 | **上下文预算裁剪 (§8.4)** | 最后被裁剪 | 最先被裁剪 |
-| **同名冲突** | 低 Tier 覆盖高 Tier (来源优先级反转: workspace > managed > bundled) | 被高优先级来源覆盖 |
+| **同名冲突** | 低 Tier 覆盖高 Tier (来源优先级反转: managed > configured > bundled) | 被高优先级来源覆盖 |
 | **多技能匹配** | LLM 系统提示词引导选择"最具体的" | 作为备选 |
 
-> **同名冲突的特殊处理**：`SkillLoader` 中同名技能按来源优先级 **workspace > managed > bundled** 覆盖（用户可以用自己的版本替换内置技能），这与 `<available_skills>` 排列顺序（按 Tier 排列）是两个独立维度。来源优先级决定"用谁的代码"，Tier 决定"在 LLM 视角中排第几"。
+> **同名冲突的特殊处理**：`SkillLoader` 中同名技能按来源优先级 **managed > configured > bundled** 覆盖（托管市场技能可以替换业务配置技能和内置技能），这与 `<available_skills>` 排列顺序（按 Tier 排列）是两个独立维度。来源优先级决定"用谁的代码"，Tier 决定"在 LLM 视角中排第几"。
 
 ### 10.4 技能加载
 
@@ -4846,16 +5571,16 @@ class SkillLoader:
         self.config = config
 
     async def load_all(self) -> list[SkillEntry]:
-        """加载并合并所有技能。同名技能按来源优先级覆盖 (workspace > managed > bundled)。
+        """加载并合并所有技能。同名技能按来源优先级覆盖 (managed > configured > bundled)。
         返回的列表按 sort_key 排序 (tier → priority → name)。
         """
         merged: dict[str, SkillEntry] = {}
 
-        # 来源覆盖优先级从低到高: bundled < managed < workspace
+        # 来源覆盖优先级从低到高: bundled < configured < managed
         sources = [
             ("bundled", self.config.bundled_skills_dir),
+            ("configured", self.config.configured_skills_dir),
             ("managed", self.config.managed_skills_dir),
-            ("workspace", self.config.workspace_skills_dir),
         ]
 
         for source_name, skills_dir in sources:
@@ -4886,7 +5611,7 @@ class SkillLoader:
                 description=frontmatter.get("description", ""),
                 base_dir=os.path.join(dir_path, item),
                 file_path=skill_md,
-                source=source,  # ← "bundled" / "managed" / "workspace"
+                source=source,  # ← "bundled" / "configured" / "managed"
                 metadata=self._parse_metadata(frontmatter),
                 invocation=self._parse_invocation(frontmatter),
             ))
@@ -4899,8 +5624,8 @@ class SkillLoader:
 | 优先级 | 目录 | 说明 |
 | --- | --- | --- |
 | 1 (最低) | `bundled_skills_dir` | 随 Runtime 分发的内置技能 |
-| 2 | `managed_skills_dir` | 平台安装的托管技能 |
-| 3 (最高) | `workspace_skills_dir` | Agent 工作空间内的本地技能 |
+| 2 | `configured_skills_dir` | 按业务需求配置的技能 |
+| 3 (最高) | `managed_skills_dir` | 平台市场安装的托管技能 |
 
 ### 10.5 技能过滤
 
@@ -5484,7 +6209,7 @@ curl -s "https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&c
 | `name` | string | ✓ | 技能唯一标识 |
 | `description` | string | ✓ | 一句话描述，供 LLM 匹配判断 |
 | `metadata.always` | bool | — | 始终启用，跳过过滤 |
-| `metadata.tier` | int (0-4) | — | 优先级层级 (默认 3, 详见 §10.3) |
+| `metadata.tier` | int (0-3) | — | 优先级层级 (默认 2, 详见 §10.3) |
 | `metadata.priority` | int | — | 同 Tier 内排序权重 (默认 100, 越小越靠前) |
 | `metadata.tags` | string[] | — | 分类标签, 如 `["devops", "deploy"]` |
 | `metadata.requires.bins` | string[] | — | 必需的二进制文件 |
@@ -5506,20 +6231,20 @@ curl -s "https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&c
   │  经过充分测试, 稳定可靠                                  │
   │  Tier 0, 最高可信度                                      │
   ├─────────────────────────────────────────────────────────┤
+  │  业务配置技能 (Configured)              [Phase 2]        │
+  │  由运营/业务团队通过平台后台配置                         │
+  │  按 Agent/场景需求启用, configured_skills_dir            │
+  │  Tier 1, 业务驱动                                        │
+  ├─────────────────────────────────────────────────────────┤
   │  托管技能 (Managed)                     [Phase 2]        │
   │  通过 /skill install 命令安装到 managed_skills_dir      │
   │  来源: 技能市场 (平台审核)                               │
-  │  Tier 1-2, 由市场标签确定                                │
-  ├─────────────────────────────────────────────────────────┤
-  │  工作空间技能 (Workspace)                                │
-  │  Agent 项目目录中的 .skills/ 文件夹                     │
-  │  开发者自行维护, 随项目版本管理                          │
-  │  Tier 3, 同名时覆盖内置和托管                            │
+  │  Tier 2, 同名时覆盖业务配置和内置技能                    │
   ├─────────────────────────────────────────────────────────┤
   │  用户上传技能 (User)                    [Phase 3]        │
   │  用户通过 API/UI 上传                                    │
   │  需要安全审核 (检查 SKILL.md 内容是否有注入风险)        │
-  │  Tier 4, 最低优先级                                      │
+  │  Tier 3, 最低优先级                                      │
   └─────────────────────────────────────────────────────────┘
 ```
 
@@ -5537,268 +6262,1065 @@ curl -s "https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&c
 | 阶段 | 范围 |
 | --- | --- |
 | **Phase 1** | 内置技能 (Tier 0) 加载 + 过滤 + 按 sort_key 排序 + 提示词生成 + 沙箱同步 |
-| **Phase 2** | 精选/托管技能 (Tier 1-2) + `/命令` 调用 + 技能安装 + 环境变量注入 + tags 过滤 |
-| **Phase 3** | 用户上传技能 (Tier 3-4) + 技能市场 + 版本管理 + 安全审核 + 热更新 |
+| **Phase 2** | 业务配置技能 (Tier 1) + 托管技能 (Tier 2) + `/命令` 调用 + 技能安装 + 环境变量注入 + tags 过滤 |
+| **Phase 3** | 用户上传技能 (Tier 3) + 技能市场 + 版本管理 + 安全审核 + 热更新 |
 
 ---
 
 ## 十一、上下文管理 (Context Manager)
 
-### 11.1 四层防御
+> 详细设计见 [CONTEXT-MANAGEMENT-DESIGN.md](./CONTEXT-MANAGEMENT-DESIGN.md)。
+> 此处仅概述核心理念和接口。
+
+### 11.1 核心理念：知识比特率与注意力衰减
+
+上下文管理的核心任务不是简单的"截断"或"丢弃"，而是同时解决两个问题：
+
+1. **知识比特率**——在有限窗口中最大化「对当前任务有价值的信息量 / 实际消耗的 Token 数」
+2. **注意力衰减**——由于 Transformer 注意力的 U 型分布 (Lost in the Middle)，上下文越长，中间信息被忽略的概率越高。即使 200K 窗口装得下，LLM 的推理质量也会随长度退化。**缩短有效上下文长度、让关键信息处于首尾高注意力区**，是与容量管理同等重要的目标。
+
+通过四种策略实现：
+
+| 策略 | 说明 | 信息损失 | Token 节省 | Phase |
+| --- | --- | --- | --- | --- |
+| **Filtering (过滤)** | 过滤重复读取、过时的探索命令等低相关性内容 | 极低 | 20-60% | 1 (规则) / 3 (语义) |
+| **Compaction (压实)** | 两阶段 (Soft/Hard) 压缩工具结果、结构化数据 | 低-中 | 30-80% | 1 |
+| **Eviction (卸载)** | 将旧消息卸载到沙箱文件，上下文仅保留索引摘要，LLM 可 read 召回 | **零** | 70-95% | 1 |
+| **Summarization (摘要)** | 用 LLM 将旧消息生成高密度摘要 (分阶段/增量) | 中 | 80-95% | 2 |
+
+### 11.2 核心接口
 
 ```python
 # sahara_runtime/context/manager.py
 
 class ContextManager:
-    def __init__(self, token_counter: TokenCounter):
-        self.counter = token_counter
-        self.truncator = InputTruncator()
-        self.pruner = HistoryPruner()
-        self.compactor = AutoCompactor()
+    """策略编排引擎。最大化知识比特率 + 缓解注意力衰减。
 
-    async def fit(self, messages, system_prompt, model: ModelConfig) -> list[dict]:
-        """确保 messages 不超过模型上下文窗口。"""
-        budget = model.max_context_tokens - model.max_tokens  # 留给输出
-        system_tokens = self.counter.count(system_prompt)
-        available = budget - system_tokens
+    执行顺序: Filtering → Compaction → Eviction → Summarization → Emergency
+    """
 
-        # Layer 1: 输入截断 (工具结果过长)
-        messages = self.truncator.truncate(messages, max_result_chars=8000)
-
-        # Layer 2: 历史剪枝 (移除旧消息)
-        total = self.counter.count_messages(messages)
-        if total > available:
-            messages = self.pruner.prune(messages, target_tokens=available)
-
-        # Layer 3: 自动压缩 (摘要化旧消息)
-        total = self.counter.count_messages(messages)
-        if total > available:
-            messages = await self.compactor.compact(messages, target_tokens=available)
-
-        return messages
+    async def fit(self, messages: list[dict], system_prompt: str,
+                  model: ModelConfig) -> list[dict]:
+        """每次 LLM 调用前编排四种策略, 确保 messages 不超过预算。"""
+        ...
 ```
 
-### 11.2 各层策略详解
+### 11.3 架构要点
 
-| 层 | 名称 | 触发条件 | 策略 | 代价 |
-| --- | --- | --- | --- | --- |
-| **Layer 1** | 输入截断 | 工具结果 > 8000 字符 | 截断为 `头部 4000 + "..." + 尾部 4000` | 丢失中间内容 |
-| **Layer 2** | 历史剪枝 | messages token > 可用预算 | 从最旧的**非系统消息**开始移除 | 丢失早期对话上下文 |
-| **Layer 3** | 自动压缩 | Layer 2 后仍超标 | 将被裁的旧消息用 LLM 生成摘要 | 额外 LLM 调用开销 |
-| **Layer 4** | 紧急溢出 | Layer 3 后仍超标 | 只保留最近 2 轮对话 + 当前用户消息 | 几乎丢失所有历史 |
+| 要点 | 说明 |
+| --- | --- |
+| **调用时机** | Agent Loop (§4) 每次 LLM 调用前, 步骤 9a |
+| **处理范围** | 仅修改内存中的 messages 副本, **Session Store 保存原始消息** |
+| **卸载机制** | 旧消息写入 `/workspace/.context/evicted/`，LLM 通过 read 工具按需召回 |
+| **Token 计数** | 精确: tiktoken; 快速: `chars / 4` |
+| **动态调整** | 大窗口 (>= 128K) 放宽策略阈值, 小窗口 (< 64K) 收紧 |
 
-```python
-# sahara_runtime/context/pruner.py
-
-class HistoryPruner:
-    def prune(self, messages: list[dict], target_tokens: int) -> list[dict]:
-        """Layer 2: 从最旧的消息开始移除, 直到总 token 不超过 target。
-        始终保留: 第一条用户消息 (任务上下文) 和最后一条用户消息 (当前请求)。
-        """
-        if len(messages) <= 2:
-            return messages
-
-        # 保护首尾
-        first_user = messages[0]
-        last_user = messages[-1]
-        middle = messages[1:-1]
-
-        # 从最旧的 middle 消息开始移除
-        while middle and self.counter.count_messages(
-            [first_user] + middle + [last_user]
-        ) > target_tokens:
-            middle.pop(0)  # 移除最旧
-
-        return [first_user] + middle + [last_user]
-```
-
-```python
-# sahara_runtime/context/compactor.py
-
-class AutoCompactor:
-    async def compact(self, messages: list[dict], target_tokens: int) -> list[dict]:
-        """Layer 3: 将旧消息压缩为摘要。
-        调用 LLM 生成摘要, 替换被压缩的消息。
-        Phase 1 先不实现, 直接回退到 Layer 4。
-        """
-        # Phase 2: 调用 LLM 生成摘要
-        # old_messages = messages[:split_point]
-        # summary = await self._summarize(old_messages)
-        # return [{"role": "system", "content": f"[对话历史摘要]\n{summary}"}] + messages[split_point:]
-
-        # Phase 1: 回退到 Layer 4 紧急策略
-        return self._emergency_truncate(messages, target_tokens)
-
-    def _emergency_truncate(self, messages, target_tokens):
-        """Layer 4: 紧急策略 — 只保留最近 2 轮 + 当前用户消息。"""
-        if len(messages) <= 4:
-            return messages
-        # 保留最后 4 条 (2 轮对话)
-        return messages[-4:]
-```
-
-### 11.3 Token 计数
-
-```python
-# sahara_runtime/context/token_counter.py
-
-class TokenCounter:
-    def __init__(self):
-        self._encoders = {}
-
-    def count(self, text: str, model: str = "cl100k_base") -> int:
-        if model not in self._encoders:
-            self._encoders[model] = tiktoken.get_encoding(model)
-        return len(self._encoders[model].encode(text))
-
-    def count_messages(self, messages: list[dict]) -> int:
-        total = 0
-        for msg in messages:
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                total += self.count(content)
-            elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict):
-                        total += self.count(json.dumps(block))
-            total += 4  # message overhead
-        return total
-```
-
----
-
-## 十二、会话管理 (Session Store)
-
-### 12.1 热冷分离
+### 11.4 包结构
 
 ```text
-┌──────────────────────────┐       ┌──────────────────────────┐
-│  Redis (热存储)           │       │  PostgreSQL (冷存储)      │
-│                          │       │                          │
-│  session:{key}:messages  │       │  sessions 表              │
-│  → 最近 N 条消息 (JSON)  │       │  ├── session_key (PK)    │
-│  → TTL 24h               │       │  ├── messages (JSONB)    │
-│                          │       │  ├── created_at          │
-│  session:{key}:meta      │       │  └── updated_at          │
-│  → { title, agent_id,   │       │                          │
-│      created_at, ... }   │       │  runs 表                 │
-│                          │       │  ├── run_id (PK)         │
-│  session:{key}:lock      │       │  ├── session_key         │
-│  → 分布式锁 (防并发)     │       │  ├── tokens_used         │
-│                          │       │  └── duration_ms         │
-└──────────────────────────┘       └──────────────────────────┘
-```
-
-### 12.2 接口
-
-```python
-# sahara_runtime/session/store.py
-
-class SessionStore:
-    async def load(self, session_key: str) -> Session:
-        """加载会话：先查 Redis，miss 则查 PG 并回填"""
-        cached = await self.redis.get(f"session:{session_key}:messages")
-        if cached:
-            return Session.from_json(cached)
-
-        # 冷加载
-        row = await self.pg.fetchrow(
-            "SELECT messages FROM sessions WHERE session_key = $1", session_key
-        )
-        if row:
-            session = Session.from_json(row["messages"])
-            # 回填 Redis
-            await self.redis.setex(
-                f"session:{session_key}:messages",
-                86400,  # 24h TTL
-                session.to_json(),
-            )
-            return session
-
-        return Session.empty(session_key)
-
-    async def save(self, session_key: str, messages: list[dict]):
-        """保存会话：同时写 Redis + PG"""
-        data = json.dumps(messages)
-        pipe = self.redis.pipeline()
-        pipe.setex(f"session:{session_key}:messages", 86400, data)
-        await pipe.execute()
-
-        # 异步写 PG (不阻塞主流程, 带重试)
-        asyncio.create_task(self._save_to_pg_with_retry(session_key, data))
-
-    async def _save_to_pg_with_retry(self, session_key: str, data: str, retries: int = 3):
-        """PG 异步写入, 失败重试, 最终失败记录日志 (不影响用户体验)。"""
-        for attempt in range(retries):
-            try:
-                await self.pg.execute(
-                    """INSERT INTO sessions (session_key, messages, updated_at)
-                       VALUES ($1, $2::jsonb, NOW())
-                       ON CONFLICT (session_key) DO UPDATE SET
-                       messages = $2::jsonb, updated_at = NOW()""",
-                    session_key, data,
-                )
-                return
-            except Exception as e:
-                if attempt == retries - 1:
-                    logger.error("session_pg_save_failed",
-                                 session_key=session_key, error=str(e))
-                    # 不抛异常: Redis 已持久化, PG 可通过后续任务补偿
-                else:
-                    await asyncio.sleep(1)
-```
-
-### 12.3 Session 分布式锁
-
-同一 session 同一时刻只允许一个 Agent 任务执行，通过 Redis 分布式锁保证：
-
-```python
-# sahara_runtime/session/lock.py
-
-class SessionLock:
-    """基于 Redis SET NX + TTL 的分布式锁。"""
-
-    def __init__(self, redis: Redis, ttl: int = 300):
-        self.redis = redis
-        self.ttl = ttl  # 锁最长持有时间 (5min, 与任务超时对齐)
-
-    async def acquire(self, session_key: str, timeout: float = 2.0) -> bool:
-        """获取 session 锁。timeout 内未获取则返回 False。
-        gRPC SubmitTask 在获取锁失败时返回 ABORTED。
-        """
-        lock_key = f"session:{session_key}:lock"
-        lock_value = f"{config.worker_id}:{time.time()}"
-        deadline = time.time() + timeout
-
-        while time.time() < deadline:
-            acquired = await self.redis.set(
-                lock_key, lock_value, nx=True, ex=self.ttl,
-            )
-            if acquired:
-                self._lock_value = lock_value
-                return True
-            await asyncio.sleep(0.1)  # 短暂退避
-
-        return False
-
-    async def release(self, session_key: str):
-        """释放锁 (只释放自己持有的锁, 防止误释放)。"""
-        lock_key = f"session:{session_key}:lock"
-        # Lua 脚本保证原子性: 只删除 value 匹配的锁
-        script = """
-            if redis.call('get', KEYS[1]) == ARGV[1] then
-                return redis.call('del', KEYS[1])
-            end
-            return 0
-        """
-        await self.redis.eval(script, 1, lock_key, self._lock_value)
+sahara_runtime/context/
+  ├── manager.py          # ContextManager — 策略编排引擎
+  ├── filtering.py        # Filtering: 规则过滤 (重复读取/探索命令)
+  ├── compaction.py       # Compaction: 两阶段压实 (Soft/Hard)
+  ├── eviction.py         # Eviction: 消息卸载到沙箱文件
+  ├── summarization.py    # Summarization: LLM 摘要 [Phase 2]
+  ├── overflow.py         # Emergency: 溢出处理 + 紧急截断
+  ├── guard.py            # ContextWindowGuard [Phase 2]
+  ├── context_files.py    # 上下文文件加载与压实
+  ├── token_counter.py    # TokenCounter
+  ├── config.py           # ContextConfig
+  └── metrics.py          # 知识比特率等指标
 ```
 
 ---
 
-## 十三、Dependencies 注入与启动流程
+## 十二、Agent Memory (记忆体系)
 
-### 13.1 Dependencies — 依赖容器
+> 详细设计见 [AGENT-MEMORY-DESIGN.md](./AGENT-MEMORY-DESIGN.md)。
+> 此处仅概述三层记忆模型和核心接口。
+
+### 12.1 三层记忆模型
+
+Agent 的记忆体系分为三层，对应人类认知中的注意力焦点、短期回忆和长期知识：
+
+```text
+Layer 1: 工作记忆 (Working Memory) = LLM 上下文中的 messages[]
+         管理者: Context Manager (§11)    生命周期: 单次 LLM 调用
+
+Layer 2: 短期记忆 (Short-term Memory) = Session Store
+         完整的、未裁剪的对话历史
+         存储: Redis (热, 24h) + PostgreSQL (冷, 永久)
+         生命周期: 一次会话
+
+Layer 3: 长期记忆 (Long-term Memory) = Knowledge Store [Phase 2]
+         跨会话的持久知识 (用户偏好、项目信息、历史决策)
+         存储: PostgreSQL + pgvector (向量语义搜索)
+         生命周期: 跨会话持久, 直到用户删除
+         检索: LLM 通过 memory_search 工具按需召回
+```
+
+### 12.2 短期记忆：Session Store
+
+```python
+# sahara_runtime/memory/session/store.py
+
+class SessionStore:
+    """短期记忆。热冷分离, Redis + PostgreSQL。"""
+
+    async def load(self, session_key: str) -> Session | None:
+        """加载会话: Redis → PG → None。"""
+        ...
+
+    async def create(self, user_id: str, agent_id: str) -> Session:
+        """创建新会话。"""
+        ...
+
+    async def save(self, session: Session):
+        """保存: 同步写 Redis + 异步写 PG。"""
+        ...
+
+    async def close(self, session_key: str):
+        """关闭会话: 标记状态 + 清缓存 + [Phase 2] 提取知识到长期记忆。"""
+        ...
+
+    async def list_sessions(self, user_id: str, agent_id: str, ...) -> list[SessionMeta]:
+        """列出用户会话 (供 API Service)。"""
+        ...
+```
+
+```python
+# sahara_runtime/memory/session/lock.py
+
+class SessionLock:
+    """Redis 分布式锁。同一 session 同一时刻只允许一个 Agent 任务。
+    基于 SET NX + TTL, Lua 脚本保证原子释放。
+    """
+    async def acquire(self, session_key: str, timeout: float = 2.0) -> bool: ...
+    async def release(self, session_key: str): ...
+```
+
+### 12.3 长期记忆：Knowledge Store [Phase 2]
+
+| 能力 | 说明 |
+| --- | --- |
+| **记忆来源** | 用户显式保存 (memory_save) / 会话自动提取 / Agent 配置 / 运营注入 |
+| **存储** | PostgreSQL + pgvector (向量索引) + pg_trgm (关键词) |
+| **检索** | 混合搜索: 向量语义 (70%) + 关键词 BM25 (30%) |
+| **工具** | `memory_search` (LLM 按需召回) / `memory_save` (LLM 保存记忆) |
+| **隔离** | 按 (user_id, agent_id) 二元组, 多租户安全 |
+| **Embedding** | 抽象接口, Phase 2 用 OpenAI, Phase 3 可自部署 |
+
+### 12.4 架构要点
+
+| 要点 | 说明 |
+| --- | --- |
+| **Session Store 保存原始消息** | Context Manager 裁剪仅在内存中, 不影响持久化 |
+| **记忆隔离** | session_key = `{user_id}:{agent_id}:{session_id}`, 记忆按 (user_id, agent_id) 隔离 |
+| **热冷分离** | Redis 99%+ 命中率, PG 异步写入不阻塞用户体验 |
+| **分布式锁** | Redis SET NX + TTL, 防止同一 session 并发执行 |
+| **长期记忆召回** | LLM 自主决定是否调用 memory_search, 结果作为 tool_result 进入工作记忆 |
+
+### 12.5 包结构
+
+```text
+sahara_runtime/memory/
+  ├── config.py                   # MemoryConfig
+  ├── session/                    # Layer 2: 短期记忆
+  │   ├── models.py               # Session, SessionMeta
+  │   ├── store.py                # SessionStore (Redis + PG)
+  │   ├── lock.py                 # SessionLock
+  │   └── metrics.py
+  ├── knowledge/                  # Layer 3: 长期记忆 [Phase 2]
+  │   ├── models.py               # MemoryEntry, MemoryChunk, SearchResult
+  │   ├── store.py                # KnowledgeStore (pgvector)
+  │   ├── search.py               # MemorySearch (混合搜索)
+  │   ├── indexer.py              # MemoryIndexer
+  │   ├── embedder.py             # Embedder ABC
+  │   ├── tools.py                # memory_search / memory_save
+  │   └── metrics.py
+  └── migration/
+      ├── 001_sessions.sql
+      └── 002_knowledge.sql       # [Phase 2]
+```
+
+---
+
+## 十三、Hook 系统 (生命周期钩子)
+
+> Hook 系统是 Runtime 的**内部扩展点框架**——在不修改核心代码的前提下，允许在 Agent Loop 各关键节点注入自定义逻辑：上下文注入、工具拦截、消息变换、统计追踪等。
+>
+> 设计灵感来自 OpenClaw 的 14 类钩子体系，但针对 Sahara Python async + C 端高并发场景做了取舍：
+> - **Python async 原生**：所有 hook handler 均为 `async def`，与 `asyncio` 事件循环原生集成
+> - **零开销守卫**：无注册 handler 时跳过所有 hook 调用点，不引入额外 `await` 开销
+> - **与 EventEmitter 互补**：EventEmitter（§5）是**向外发射事件**给消费者；Hook 系统是**向内扩展行为**给 Runtime 自身
+
+### 13.1 Hook 在 Agent Loop 流程中的位置
+
+```text
+SubmitTask (gRPC)
+    │
+    ▼
+┌── ① on_task_received ──────────────────────────────────────────────┐
+│   观察入站任务 (fire-and-forget)                                     │
+│                                                                       │
+│   Session 加载 → 模型解析 → 沙箱分配 → 技能加载 → 工具创建          │
+│   → 系统提示词构建                                                    │
+│                                                                       │
+├── ② before_agent_loop ──────────────────────────────────────────────┤
+│   注入上下文 / 修改提示词 / 准备追踪 (可修改)                         │
+│                                                                       │
+│   ┌── 交互循环 (max N 轮) ────────────────────────────────────┐     │
+│   │                                                            │     │
+│   │  ③ before_llm_call (可修改 messages/system_prompt)        │     │
+│   │       │                                                    │     │
+│   │       ▼                                                    │     │
+│   │  LLM API 流式调用                                          │     │
+│   │       │                                                    │     │
+│   │  ④ after_llm_response (观察/修改响应, 判定 stop_reason)   │     │
+│   │       │                                                    │     │
+│   │       ├── end_turn → 跳出循环                              │     │
+│   │       │                                                    │     │
+│   │       └── tool_use:                                        │     │
+│   │            │                                                │     │
+│   │       ⑤ before_tool_execute (可修改参数 / 拦截)            │     │
+│   │            │                                                │     │
+│   │       Tool 执行 (沙箱内)                                    │     │
+│   │            │                                                │     │
+│   │       ⑥ after_tool_execute (观察/修改结果)                  │     │
+│   │            │                                                │     │
+│   │       结果回传 messages → 继续循环                          │     │
+│   │                                                            │     │
+│   └────────────────────────────────────────────────────────────┘     │
+│                                                                       │
+├── ⑦ before_session_save ────────────────────────────────────────────┤
+│   持久化前消息变换 (脱敏/过滤) (可修改)                               │
+│                                                                       │
+├── ⑧ on_task_complete ──────────────────────────────────────────────┤
+│   追踪完成状态 (fire-and-forget)                                      │
+│                                                                       │
+└── 释放沙箱 → 返回 ─────────────────────────────────────────────────┘
+```
+
+### 13.2 Hook 类型全览
+
+Sahara 定义 **12 种** Hook 类型，分为 5 个生命周期类别：
+
+| 类别 | Hook 名 | 执行模式 | Phase | 说明 |
+| --- | --- | --- | --- | --- |
+| **任务生命周期** | `on_task_received` | 并行 (观察) | 1 | gRPC SubmitTask 到达, 在任何处理之前 |
+| | `on_task_complete` | 并行 (观察) | 1 | 任务结束 (成功/失败/中止/超时) |
+| **Agent Loop** | `before_agent_loop` | 串行 (可修改) | 1 | 所有子系统就绪后、进入循环前, 可注入上下文 |
+| | `after_agent_loop` | 并行 (观察) | 2 | 循环退出后、Session 持久化前 |
+| **LLM 调用** | `before_llm_call` | 串行 (可修改) | 2 | 每轮 LLM 调用前, 可修改 messages 和 system_prompt |
+| | `after_llm_response` | 串行 (可修改) | 2 | LLM 响应完成后, 可修改 assistant 消息 |
+| **工具执行** | `before_tool_execute` | 串行 (可修改/拦截) | 1 | 每次工具执行前, 可修改参数或阻止执行 |
+| | `after_tool_execute` | 串行 (可修改) | 1 | 工具执行后, 可修改 tool_result 内容 |
+| **Session** | `before_session_save` | 串行 (可修改) | 2 | Session 持久化前, 可脱敏/过滤消息 |
+| | `on_session_load` | 并行 (观察) | 2 | Session 历史加载完成后 |
+| **Prompt** | `before_prompt_build` | 串行 (可修改) | 2 | 系统提示词组装前, 可注入额外段落 |
+| | `after_prompt_build` | 串行 (可修改) | 2 | 系统提示词组装后, 可修改最终提示词 |
+
+**执行模式说明**：
+
+- **并行 (观察)**：所有 handler 通过 `asyncio.gather()` 并发执行，返回值被忽略（fire-and-forget）
+- **串行 (可修改)**：handler 按优先级顺序串行执行，前一个的输出作为后一个的输入（链式传递）
+- **串行 (可修改/拦截)**：同上，但 handler 可通过返回 `block=True` 阻止后续执行
+
+### 13.3 核心抽象
+
+```python
+# sahara_runtime/hooks/types.py
+
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import Any, Callable, Awaitable
+
+class HookName(str, Enum):
+    """所有 Hook 类型枚举。"""
+    # ── 任务生命周期 ──
+    ON_TASK_RECEIVED = "on_task_received"
+    ON_TASK_COMPLETE = "on_task_complete"
+    # ── Agent Loop ──
+    BEFORE_AGENT_LOOP = "before_agent_loop"
+    AFTER_AGENT_LOOP = "after_agent_loop"
+    # ── LLM 调用 ──
+    BEFORE_LLM_CALL = "before_llm_call"
+    AFTER_LLM_RESPONSE = "after_llm_response"
+    # ── 工具执行 ──
+    BEFORE_TOOL_EXECUTE = "before_tool_execute"
+    AFTER_TOOL_EXECUTE = "after_tool_execute"
+    # ── Session ──
+    BEFORE_SESSION_SAVE = "before_session_save"
+    ON_SESSION_LOAD = "on_session_load"
+    # ── Prompt ──
+    BEFORE_PROMPT_BUILD = "before_prompt_build"
+    AFTER_PROMPT_BUILD = "after_prompt_build"
+
+
+class HookMode(str, Enum):
+    """Hook 执行模式。"""
+    PARALLEL = "parallel"      # 并行观察, fire-and-forget
+    SEQUENTIAL = "sequential"  # 串行链式, 可修改数据
+
+
+# ── Hook 执行模式映射 (由 HookRunner 使用) ──
+HOOK_MODES: dict[HookName, HookMode] = {
+    HookName.ON_TASK_RECEIVED:    HookMode.PARALLEL,
+    HookName.ON_TASK_COMPLETE:    HookMode.PARALLEL,
+    HookName.BEFORE_AGENT_LOOP:   HookMode.SEQUENTIAL,
+    HookName.AFTER_AGENT_LOOP:    HookMode.PARALLEL,
+    HookName.BEFORE_LLM_CALL:     HookMode.SEQUENTIAL,
+    HookName.AFTER_LLM_RESPONSE:  HookMode.SEQUENTIAL,
+    HookName.BEFORE_TOOL_EXECUTE: HookMode.SEQUENTIAL,
+    HookName.AFTER_TOOL_EXECUTE:  HookMode.SEQUENTIAL,
+    HookName.BEFORE_SESSION_SAVE: HookMode.SEQUENTIAL,
+    HookName.ON_SESSION_LOAD:     HookMode.PARALLEL,
+    HookName.BEFORE_PROMPT_BUILD: HookMode.SEQUENTIAL,
+    HookName.AFTER_PROMPT_BUILD:  HookMode.SEQUENTIAL,
+}
+
+
+@dataclass
+class HookContext:
+    """Hook handler 接收的上下文 (只读)。"""
+    run_id: str
+    session_key: str
+    agent_id: str
+    user_id: str
+    worker_id: str
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+# Handler 签名: async def handler(event: dict, ctx: HookContext) -> dict | None
+HookHandler = Callable[[dict, HookContext], Awaitable[dict | None]]
+
+
+@dataclass
+class HookRegistration:
+    """一次 Hook 注册。"""
+    hook_name: HookName
+    handler: HookHandler
+    priority: int = 0               # 高优先级先执行 (仅 SEQUENTIAL 模式)
+    source: str = "internal"        # "internal" | "plugin" | 插件名
+    catch_errors: bool = True       # True=捕获错误继续; False=错误中断链
+```
+
+### 13.4 HookRunner — 执行引擎
+
+```python
+# sahara_runtime/hooks/runner.py
+
+import asyncio
+import structlog
+from .types import (
+    HookName, HookMode, HookContext, HookRegistration,
+    HookHandler, HOOK_MODES,
+)
+
+logger = structlog.get_logger(__name__)
+
+
+class HookRunner:
+    """Hook 执行引擎。管理 handler 注册与执行。
+    
+    设计原则:
+    - 零开销守卫: has_hooks() 为 O(1) 检查, 无注册时跳过一切
+    - 错误隔离: 默认捕获 handler 错误, 不影响主流程
+    - 优先级排序: SEQUENTIAL 模式按 priority 降序执行
+    """
+
+    def __init__(self) -> None:
+        # hook_name → sorted list of registrations
+        self._hooks: dict[HookName, list[HookRegistration]] = {
+            name: [] for name in HookName
+        }
+        # 快速检查: 是否有任何 handler 注册
+        self._has_hooks: dict[HookName, bool] = {
+            name: False for name in HookName
+        }
+
+    # ── 注册 ──
+
+    def register(self, reg: HookRegistration) -> None:
+        """注册一个 hook handler。"""
+        self._hooks[reg.hook_name].append(reg)
+        # 按 priority 降序排列 (高优先级先执行)
+        self._hooks[reg.hook_name].sort(key=lambda r: -r.priority)
+        self._has_hooks[reg.hook_name] = True
+        logger.info("hook_registered",
+                     hook=reg.hook_name.value,
+                     source=reg.source,
+                     priority=reg.priority)
+
+    def unregister(self, hook_name: HookName, source: str) -> int:
+        """按 source 移除指定 hook 的所有 handler。返回移除数量。"""
+        before = len(self._hooks[hook_name])
+        self._hooks[hook_name] = [
+            r for r in self._hooks[hook_name] if r.source != source
+        ]
+        removed = before - len(self._hooks[hook_name])
+        self._has_hooks[hook_name] = len(self._hooks[hook_name]) > 0
+        return removed
+
+    def has_hooks(self, hook_name: HookName) -> bool:
+        """O(1) 检查。Agent Loop 中的调用点先检查此方法, 为 False 时零开销跳过。"""
+        return self._has_hooks[hook_name]
+
+    # ── 执行 ──
+
+    async def run(self, hook_name: HookName, event: dict,
+                  ctx: HookContext) -> dict | None:
+        """执行指定 hook 的所有 handler。
+        
+        - PARALLEL 模式: asyncio.gather(), 返回 None
+        - SEQUENTIAL 模式: 链式传递, 返回最终 event
+        
+        Agent Loop 调用示例:
+            if hook_runner.has_hooks(HookName.BEFORE_TOOL_EXECUTE):
+                result = await hook_runner.run(
+                    HookName.BEFORE_TOOL_EXECUTE, event, ctx
+                )
+        """
+        if not self._has_hooks[hook_name]:
+            return None
+
+        mode = HOOK_MODES[hook_name]
+        registrations = self._hooks[hook_name]
+
+        if mode == HookMode.PARALLEL:
+            await self._run_parallel(hook_name, registrations, event, ctx)
+            return None
+        else:
+            return await self._run_sequential(hook_name, registrations, event, ctx)
+
+    async def _run_parallel(self, hook_name: HookName,
+                            registrations: list[HookRegistration],
+                            event: dict, ctx: HookContext) -> None:
+        """并行执行 (fire-and-forget)。每个 handler 独立捕获错误。"""
+        tasks = []
+        for reg in registrations:
+            tasks.append(self._safe_call(hook_name, reg, event, ctx))
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _run_sequential(self, hook_name: HookName,
+                              registrations: list[HookRegistration],
+                              event: dict, ctx: HookContext) -> dict:
+        """串行链式执行。前一个 handler 的输出 merge 到 event 后传给下一个。"""
+        current_event = event
+        for reg in registrations:
+            try:
+                result = await reg.handler(current_event, ctx)
+                if result is not None:
+                    # 检查是否被拦截 (仅 before_tool_execute 支持)
+                    if result.get("blocked"):
+                        logger.info("hook_blocked",
+                                    hook=hook_name.value,
+                                    source=reg.source,
+                                    reason=result.get("block_reason", ""))
+                        return result  # 立即返回, 不再执行后续 handler
+                    # 合并修改
+                    current_event = {**current_event, **result}
+            except Exception as e:
+                if reg.catch_errors:
+                    logger.warning("hook_handler_error",
+                                   hook=hook_name.value,
+                                   source=reg.source,
+                                   error=str(e))
+                else:
+                    raise
+        return current_event
+
+    async def _safe_call(self, hook_name: HookName,
+                         reg: HookRegistration,
+                         event: dict, ctx: HookContext) -> None:
+        """安全调用单个 handler (用于并行模式)。"""
+        try:
+            await reg.handler(event, ctx)
+        except Exception as e:
+            logger.warning("hook_handler_error",
+                           hook=hook_name.value,
+                           source=reg.source,
+                           error=str(e))
+```
+
+### 13.5 每种 Hook 的输入与输出
+
+#### 任务生命周期
+
+**`on_task_received`** — 任务到达 (观察)
+
+```python
+# event
+{
+    "task_id": str,
+    "agent_id": str,
+    "session_key": str,
+    "user_message": str,         # 用户输入 (可用于审计)
+    "metadata": dict,            # gRPC metadata
+}
+# return: None (fire-and-forget)
+```
+
+**`on_task_complete`** — 任务结束 (观察)
+
+```python
+# event
+{
+    "task_id": str,
+    "success": bool,
+    "error": str | None,
+    "duration_ms": int,
+    "llm_rounds": int,           # LLM 交互轮次
+    "tools_called": list[str],   # 调用过的工具名列表
+    "total_tokens": int,         # 总 token 消耗
+}
+# return: None (fire-and-forget)
+```
+
+#### Agent Loop
+
+**`before_agent_loop`** — 注入上下文 / 修改提示词
+
+```python
+# event
+{
+    "system_prompt": str,        # 已构建的系统提示词
+    "messages": list[dict],      # 当前 messages (含历史)
+    "tools": list[str],          # 可用工具名列表
+    "agent_config": dict,        # Agent 配置
+}
+# return (可选):
+{
+    "prepend_context": str,      # 注入到 system_prompt 前的额外上下文
+    "system_prompt": str,        # 覆盖系统提示词 (优先于 prepend_context)
+    "extra_messages": list[dict],# 追加到 messages 末尾的额外消息
+}
+```
+
+**`after_agent_loop`** — 循环结束后观察
+
+```python
+# event
+{
+    "messages": list[dict],      # 完整的 messages (含本轮所有交互)
+    "success": bool,
+    "llm_rounds": int,
+    "final_response": str,       # LLM 最终回复文本
+}
+# return: None (fire-and-forget)
+```
+
+#### LLM 调用
+
+**`before_llm_call`** — 每轮 LLM 调用前
+
+```python
+# event
+{
+    "system_prompt": str,
+    "messages": list[dict],
+    "tools": list[dict],         # LLM 工具定义
+    "model": str,                # 当前使用的模型
+    "round": int,                # 第几轮调用 (1-based)
+}
+# return (可选):
+{
+    "messages": list[dict],      # 修改后的 messages
+    "system_prompt": str,        # 修改后的 system_prompt
+}
+```
+
+**`after_llm_response`** — LLM 响应完成后
+
+```python
+# event
+{
+    "assistant_message": dict,   # LLM 原始 assistant 响应
+    "stop_reason": str,          # "end_turn" | "tool_use" | ...
+    "usage": dict,               # token 使用统计
+    "model": str,
+    "round": int,
+    "latency_ms": int,           # LLM 响应延迟
+}
+# return (可选):
+{
+    "assistant_message": dict,   # 修改后的 assistant 响应 (慎用)
+}
+```
+
+#### 工具执行
+
+**`before_tool_execute`** — 工具执行前 (可拦截)
+
+```python
+# event
+{
+    "tool_name": str,
+    "tool_call_id": str,
+    "params": dict,              # 工具参数
+    "tool_tier": int,            # 工具优先级层 (0-3)
+}
+# return (可选):
+{
+    "params": dict,              # 修改后的参数
+    "blocked": bool,             # True = 阻止执行
+    "block_reason": str,         # 阻止原因 (会传给 LLM)
+}
+```
+
+**`after_tool_execute`** — 工具执行后
+
+```python
+# event
+{
+    "tool_name": str,
+    "tool_call_id": str,
+    "params": dict,              # 原始参数
+    "result": str,               # 工具执行结果
+    "is_error": bool,
+    "duration_ms": int,
+}
+# return (可选):
+{
+    "result": str,               # 修改后的结果 (如脱敏)
+}
+```
+
+#### Session
+
+**`before_session_save`** — Session 持久化前
+
+```python
+# event
+{
+    "messages": list[dict],      # 即将持久化的 messages
+    "session_key": str,
+}
+# return (可选):
+{
+    "messages": list[dict],      # 修改后的 messages (脱敏/过滤)
+}
+```
+
+### 13.6 与 Agent Loop 的集成
+
+```python
+# sahara_runtime/agent_loop.py — Hook 嵌入点 (概要)
+
+async def run_agent_loop(deps: Dependencies, task_handle, ...):
+    hook_runner: HookRunner = deps.hook_runner
+    hook_ctx = HookContext(
+        run_id=run_id, session_key=session_key,
+        agent_id=agent_id, user_id=user_id, worker_id=worker_id,
+    )
+
+    # ── ① on_task_received (fire-and-forget) ──
+    if hook_runner.has_hooks(HookName.ON_TASK_RECEIVED):
+        await hook_runner.run(HookName.ON_TASK_RECEIVED, {
+            "task_id": task_id, "agent_id": agent_id,
+            "session_key": session_key, "user_message": user_message,
+            "metadata": metadata,
+        }, hook_ctx)
+
+    # ... 步骤 1-8: Session/模型/沙箱/工具/提示词 准备 ...
+
+    # ── ② before_agent_loop (可修改) ──
+    if hook_runner.has_hooks(HookName.BEFORE_AGENT_LOOP):
+        loop_event = await hook_runner.run(HookName.BEFORE_AGENT_LOOP, {
+            "system_prompt": system_prompt,
+            "messages": messages,
+            "tools": [t.name for t in tools],
+            "agent_config": agent_config,
+        }, hook_ctx)
+        if loop_event:
+            if "system_prompt" in loop_event:
+                system_prompt = loop_event["system_prompt"]
+            elif "prepend_context" in loop_event:
+                system_prompt = loop_event["prepend_context"] + "\n\n" + system_prompt
+            if "extra_messages" in loop_event:
+                messages.extend(loop_event["extra_messages"])
+
+    # ── 交互循环 ──
+    for round_num in range(1, max_rounds + 1):
+
+        # ── ③ before_llm_call (可修改) ──
+        if hook_runner.has_hooks(HookName.BEFORE_LLM_CALL):
+            llm_event = await hook_runner.run(HookName.BEFORE_LLM_CALL, {
+                "system_prompt": system_prompt, "messages": messages,
+                "tools": tool_definitions, "model": model, "round": round_num,
+            }, hook_ctx)
+            if llm_event:
+                messages = llm_event.get("messages", messages)
+                system_prompt = llm_event.get("system_prompt", system_prompt)
+
+        response = await call_llm_streaming(...)
+
+        # ── ④ after_llm_response (可修改) ──
+        if hook_runner.has_hooks(HookName.AFTER_LLM_RESPONSE):
+            resp_event = await hook_runner.run(HookName.AFTER_LLM_RESPONSE, {
+                "assistant_message": response.message,
+                "stop_reason": response.stop_reason,
+                "usage": response.usage, "model": model,
+                "round": round_num, "latency_ms": response.latency_ms,
+            }, hook_ctx)
+            if resp_event and "assistant_message" in resp_event:
+                response.message = resp_event["assistant_message"]
+
+        if response.stop_reason == "end_turn":
+            break
+
+        # ── 工具执行 ──
+        for tool_call in response.tool_calls:
+
+            # ── ⑤ before_tool_execute (可修改/拦截) ──
+            if hook_runner.has_hooks(HookName.BEFORE_TOOL_EXECUTE):
+                tool_event = await hook_runner.run(HookName.BEFORE_TOOL_EXECUTE, {
+                    "tool_name": tool_call.name,
+                    "tool_call_id": tool_call.id,
+                    "params": tool_call.params,
+                    "tool_tier": tool_call.tier,
+                }, hook_ctx)
+                if tool_event and tool_event.get("blocked"):
+                    # 生成拦截结果给 LLM
+                    result = f"Tool blocked: {tool_event.get('block_reason', 'blocked by hook')}"
+                    messages.append(make_tool_result(tool_call.id, result, is_error=True))
+                    continue
+                if tool_event and "params" in tool_event:
+                    tool_call.params = tool_event["params"]
+
+            result = await tool_executor.execute(tool_call)
+
+            # ── ⑥ after_tool_execute (可修改) ──
+            if hook_runner.has_hooks(HookName.AFTER_TOOL_EXECUTE):
+                after_event = await hook_runner.run(HookName.AFTER_TOOL_EXECUTE, {
+                    "tool_name": tool_call.name,
+                    "tool_call_id": tool_call.id,
+                    "params": tool_call.params,
+                    "result": result.output,
+                    "is_error": result.is_error,
+                    "duration_ms": result.duration_ms,
+                }, hook_ctx)
+                if after_event and "result" in after_event:
+                    result.output = after_event["result"]
+
+            messages.append(make_tool_result(tool_call.id, result.output))
+
+    # ── ⑦ before_session_save (可修改) ──
+    if hook_runner.has_hooks(HookName.BEFORE_SESSION_SAVE):
+        save_event = await hook_runner.run(HookName.BEFORE_SESSION_SAVE, {
+            "messages": messages, "session_key": session_key,
+        }, hook_ctx)
+        if save_event and "messages" in save_event:
+            messages = save_event["messages"]
+
+    await session_store.save(session_key, messages)
+
+    # ── ⑧ on_task_complete (fire-and-forget) ──
+    if hook_runner.has_hooks(HookName.ON_TASK_COMPLETE):
+        await hook_runner.run(HookName.ON_TASK_COMPLETE, {
+            "task_id": task_id, "success": True,
+            "duration_ms": elapsed_ms, "llm_rounds": round_num,
+            "tools_called": tools_called, "total_tokens": total_tokens,
+        }, hook_ctx)
+```
+
+### 13.7 优先级与错误处理
+
+#### 优先级规则
+
+```text
+handler 按 priority 降序排列:
+  priority=100  →  最先执行 (安全检查、审计)
+  priority=0    →  默认优先级
+  priority=-10  →  最后执行 (统计收集)
+
+仅对 SEQUENTIAL 模式有意义, PARALLEL 模式并发执行无顺序。
+```
+
+#### 错误处理策略
+
+| 选项 | 行为 | 适用场景 |
+| --- | --- | --- |
+| `catch_errors=True` (默认) | 错误被 `structlog` 记录, 继续执行后续 handler | 所有非关键 hook |
+| `catch_errors=False` | 错误直接抛出, 中断执行链 | 安全相关的 hook (如工具拦截) |
+
+**核心原则**：Hook handler 的错误**绝不应导致 Agent Loop 崩溃**。除非 handler 显式声明 `catch_errors=False`（用于安全审计等必须生效的场景），否则所有错误都被捕获并记录。
+
+### 13.8 内置 Hook 与扩展 Hook
+
+Sahara 区分两类 Hook：
+
+| 维度 | 内置 Hook (Internal) | 扩展 Hook (Extension) |
+| --- | --- | --- |
+| 注册方式 | 代码中直接 `hook_runner.register()` | 通过配置或 Plugin API 注册 |
+| 来源 | Sahara Runtime 核心代码 | 用户自定义、第三方插件 |
+| 优先级范围 | 50-100 (保留高优先级) | 0-49 (不能覆盖内置) |
+| 错误处理 | 部分 `catch_errors=False` | 强制 `catch_errors=True` |
+| 示例 | 安全拦截、审计日志、Metrics 采集 | RAG 上下文注入、自定义脱敏、A/B 测试 |
+
+**Phase 1 内置 Hook 示例**：
+
+```python
+# sahara_runtime/hooks/builtin.py
+
+def register_builtin_hooks(hook_runner: HookRunner) -> None:
+    """注册 Sahara 内置 hook handler。"""
+
+    # ── 安全: 拦截高危工具参数 ──
+    async def security_tool_guard(event: dict, ctx: HookContext) -> dict | None:
+        """拦截危险命令 (补充 §7.11 的工具安全策略)。"""
+        if event["tool_name"] == "exec":
+            cmd = event["params"].get("command", "")
+            for pattern in DANGEROUS_PATTERNS:
+                if pattern in cmd:
+                    return {
+                        "blocked": True,
+                        "block_reason": f"Dangerous pattern detected: {pattern}",
+                    }
+        return None
+
+    hook_runner.register(HookRegistration(
+        hook_name=HookName.BEFORE_TOOL_EXECUTE,
+        handler=security_tool_guard,
+        priority=100,           # 最高优先级, 安全检查第一个执行
+        source="builtin:security",
+        catch_errors=False,     # 安全 hook 不容忍错误
+    ))
+
+    # ── 审计: 记录工具调用链 ──
+    async def audit_tool_call(event: dict, ctx: HookContext) -> None:
+        logger.info("tool_audit",
+                     run_id=ctx.run_id,
+                     tool=event["tool_name"],
+                     params_keys=list(event["params"].keys()),
+                     duration_ms=event.get("duration_ms"),
+                     is_error=event.get("is_error"))
+
+    hook_runner.register(HookRegistration(
+        hook_name=HookName.AFTER_TOOL_EXECUTE,
+        handler=audit_tool_call,
+        priority=90,
+        source="builtin:audit",
+    ))
+
+    # ── Metrics: 采集 LLM 延迟分布 ──
+    async def llm_latency_metric(event: dict, ctx: HookContext) -> None:
+        sahara_rt_llm_call_duration_seconds.labels(
+            model=event["model"],
+        ).observe(event["latency_ms"] / 1000)
+
+    hook_runner.register(HookRegistration(
+        hook_name=HookName.AFTER_LLM_RESPONSE,
+        handler=llm_latency_metric,
+        priority=50,
+        source="builtin:metrics",
+    ))
+```
+
+### 13.9 Hook 与 EventEmitter 的边界
+
+两者容易混淆，必须明确职责划分：
+
+```text
+┌─────────────────────────────┐     ┌─────────────────────────────┐
+│       Hook 系统 (§13)        │     │    EventEmitter (§5)         │
+│                             │     │                             │
+│  方向: 向内 (扩展自身行为)    │     │  方向: 向外 (通知外部消费者)  │
+│  时机: 流程执行中 (同步拦截)  │     │  时机: 流程执行后 (异步发射)  │
+│  能力: 可修改/拦截/注入       │     │  能力: 只读通知, 不影响流程   │
+│  消费者: Runtime 自身/插件    │     │  消费者: Gateway/前端/分析    │
+│  传输: 进程内函数调用         │     │  传输: Redis Streams / MQ    │
+│  性能: 微秒级 (函数调用)      │     │  性能: 毫秒级 (网络 IO)      │
+│                             │     │                             │
+│  例: before_tool_execute     │     │  例: TOOL_START 事件          │
+│  → 修改参数或拦截工具         │     │  → 通知前端工具开始执行       │
+└─────────────────────────────┘     └─────────────────────────────┘
+
+互补关系:
+  Agent Loop 执行工具时 →
+    1. Hook: before_tool_execute (可修改参数/拦截)
+    2. EventEmitter: emit TOOL_START (通知外部)
+    3. 执行工具
+    4. Hook: after_tool_execute (可修改结果)
+    5. EventEmitter: emit TOOL_RESULT (通知外部)
+```
+
+### 13.10 与 Dependencies 的集成
+
+```python
+# sahara_runtime/deps.py — 增加 HookRunner
+
+@dataclass
+class Dependencies:
+    # ... 已有字段 ...
+    hook_runner: HookRunner              # Hook 执行引擎
+
+# sahara_runtime/server.py — 启动流程
+
+async def start_server(config: RuntimeConfig):
+    # ... 已有初始化 ...
+
+    # ── Hook 系统 ──
+    hook_runner = HookRunner()
+    register_builtin_hooks(hook_runner)   # 注册内置 hook (安全/审计/Metrics)
+
+    deps = Dependencies(
+        # ... 已有字段 ...
+        hook_runner=hook_runner,
+    )
+```
+
+### 13.11 扩展 Hook 注册 (Phase 2+)
+
+Phase 2 支持通过 Agent 配置注册扩展 Hook：
+
+```yaml
+# agent_config.yaml — Agent 级 hook 配置
+
+hooks:
+  - name: "rag_context_injection"
+    event: "before_agent_loop"
+    priority: 30
+    module: "sahara_runtime.hooks.extensions.rag_injection"
+    handler: "inject_rag_context"
+    config:
+      vector_db: "pgvector"
+      top_k: 5
+      similarity_threshold: 0.75
+
+  - name: "pii_redaction"
+    event: "before_session_save"
+    priority: 40
+    module: "sahara_runtime.hooks.extensions.pii_redactor"
+    handler: "redact_pii"
+    config:
+      patterns: ["email", "phone", "ssn"]
+```
+
+```python
+# sahara_runtime/hooks/loader.py — 扩展 Hook 加载器
+
+class HookLoader:
+    """从 Agent 配置动态加载扩展 Hook。"""
+
+    async def load_from_config(self, agent_config: dict,
+                               hook_runner: HookRunner) -> int:
+        """加载 Agent 配置中声明的 hook。返回注册数量。"""
+        hooks_config = agent_config.get("hooks", [])
+        count = 0
+        for hook_def in hooks_config:
+            try:
+                module = importlib.import_module(hook_def["module"])
+                handler = getattr(module, hook_def["handler"])
+
+                # 扩展 hook 优先级上限为 49 (不能覆盖内置)
+                priority = min(hook_def.get("priority", 0), 49)
+
+                hook_runner.register(HookRegistration(
+                    hook_name=HookName(hook_def["event"]),
+                    handler=handler,
+                    priority=priority,
+                    source=f"extension:{hook_def['name']}",
+                    catch_errors=True,  # 扩展 hook 强制捕获错误
+                ))
+                count += 1
+            except Exception as e:
+                logger.error("hook_load_failed",
+                             hook=hook_def.get("name"),
+                             error=str(e))
+        return count
+```
+
+### 13.12 性能考量
+
+Hook 系统嵌入 Agent Loop 热路径，性能至关重要：
+
+| 策略 | 说明 | 预期开销 |
+| --- | --- | --- |
+| **零开销守卫** | `has_hooks()` O(1) bool 检查，无注册时跳过所有逻辑 | 0 (无 handler 时) |
+| **避免 dict 拷贝** | SEQUENTIAL 模式仅在 handler 返回非 None 时合并 | 最小化分配 |
+| **PARALLEL 使用 gather** | 观察类 hook 并发执行，不阻塞主流程 | 单次 gather 开销 |
+| **超时保护** | 每个 handler 最多执行 `hook_timeout_ms` (默认 500ms) | 防止 handler 卡死 |
+| **handler 数量告警** | 单个 hook 注册超过 10 个 handler 时发出警告 | 避免链条过长 |
+
+```python
+# 超时保护实现 (在 _safe_call 中)
+async def _safe_call(self, hook_name, reg, event, ctx):
+    try:
+        await asyncio.wait_for(
+            reg.handler(event, ctx),
+            timeout=self._hook_timeout_s,  # 默认 0.5s
+        )
+    except asyncio.TimeoutError:
+        logger.warning("hook_timeout", hook=hook_name.value,
+                       source=reg.source, timeout_s=self._hook_timeout_s)
+    except Exception as e:
+        logger.warning("hook_handler_error", hook=hook_name.value,
+                       source=reg.source, error=str(e))
+```
+
+### 13.13 可观测性
+
+Hook 系统自身的可观测性：
+
+```python
+# Prometheus 指标
+sahara_rt_hook_invocations_total       # counter: hook={name}, source={source}, status={ok|error|timeout|blocked}
+sahara_rt_hook_duration_seconds        # histogram: hook={name}, source={source}
+sahara_rt_hook_registered_handlers     # gauge: hook={name}  — 当前注册数量
+```
+
+```python
+# structlog 日志示例
+{"event": "hook_registered",  "hook": "before_tool_execute", "source": "builtin:security", "priority": 100}
+{"event": "hook_blocked",     "hook": "before_tool_execute", "source": "builtin:security", "reason": "rm -rf detected"}
+{"event": "hook_timeout",     "hook": "before_llm_call",     "source": "extension:rag",     "timeout_s": 0.5}
+{"event": "hook_handler_error","hook": "after_tool_execute",  "source": "extension:custom",  "error": "..."}
+```
+
+### 13.14 包结构
+
+```text
+sahara_runtime/
+  hooks/
+    __init__.py
+    types.py          # HookName, HookMode, HookRegistration, HookContext
+    runner.py          # HookRunner 执行引擎
+    builtin.py         # 内置 hook handler (安全/审计/Metrics)
+    loader.py          # 扩展 Hook 加载器 (Phase 2)
+    extensions/        # 扩展 hook 实现目录 (Phase 2+)
+      __init__.py
+      rag_injection.py
+      pii_redactor.py
+```
+
+### 13.15 Phase 规划
+
+| Phase | 范围 | 说明 |
+| --- | --- | --- |
+| **Phase 1** | HookRunner 核心 + 4 个内置 hook: `on_task_received`, `on_task_complete`, `before_tool_execute`, `after_tool_execute` | 覆盖安全拦截 + 审计 + 基础 Metrics |
+| **Phase 2** | + `before_agent_loop`, `before/after_llm_call`, `before_session_save`, 扩展 Hook 配置加载 | 支持 RAG 注入、PII 脱敏、LLM 调用追踪 |
+| **Phase 3** | + `on_session_load`, `before/after_prompt_build`, Plugin API (外部插件注册 hook) | 完整插件生态支持 |
+
+
+---
+
+## 十四、Dependencies 注入与启动流程
+
+> 本节是 Runtime 的"总装车间 + 开机流程 + 关机流程"。
+> 它本身不做业务逻辑，但决定了所有业务模块如何被组装、启动和安全关闭。
+
+**解决的问题**：Runtime 有十几个子系统（模型路由、工具、沙箱、记忆、事件、上下文管理……），它们之间存在复杂的依赖关系。如果每个模块自行创建依赖，会导致耦合混乱、难以测试、难以替换实现。
+
+**三个核心工程价值**：
+
+| 价值 | 说明 |
+| --- | --- |
+| **可测试性** | 测试时传入 mock 对象（`NoopSandbox`、`InMemoryBackend`），无需真实 Redis/Docker |
+| **可插拔性** | 换 EventEmitter 后端（Redis → Kafka）只改一处工厂调用，Agent Loop 代码零改动 |
+| **运维安全** | 优雅关闭确保用户正在进行的对话不被中断；K8s 滚动更新先 DRAINING 再关停 |
+
+### 14.1 Dependencies — 依赖容器
 
 Runtime 的所有子系统通过一个 `Dependencies` 容器组装。构造时注入，不使用全局变量，便于测试 mock。
 
@@ -5834,7 +7356,7 @@ class Dependencies:
     agent_servicer: AgentServicer | None = None
 ```
 
-### 13.2 启动流程
+### 14.2 启动流程
 
 ```python
 # sahara_runtime/main.py
@@ -5868,6 +7390,8 @@ async def start_server():
     tool_registry = ToolRegistry()
     tool_policy = ToolPolicy()
     sandbox_manager = create_sandbox_manager(config)  # 可插拔: Docker/gVisor/Firecracker/Remote/Noop
+    skill_loader = SkillLoader(config)
+    skill_filter = SkillFilter()
     dedup = RedisIdempotencyStore(redis)
 
     deps = Dependencies(
@@ -5876,7 +7400,9 @@ async def start_server():
         session_lock=session_lock, model_router=model_router,
         context_manager=context_manager, prompt_builder=prompt_builder,
         tool_registry=tool_registry, tool_policy=tool_policy,
-        sandbox_manager=sandbox_manager, dedup=dedup,
+        sandbox_manager=sandbox_manager,
+        skill_loader=skill_loader, skill_filter=skill_filter,
+        dedup=dedup,
     )
 
     # ── Phase 3: 沙箱预热 ──
@@ -5976,44 +7502,228 @@ t=N    收到 SIGTERM
 
 ---
 
-## 十四、并发模型
+## 十五、并发模型
 
-### 14.1 asyncio 架构
+### 15.1 为什么需要并发模型设计
+
+一个 Agent 任务的典型生命周期中，**90%+ 的时间在等 IO**：
 
 ```text
-Python 进程 (单线程 asyncio 事件循环)
-  │
-  ├── gRPC async server                    1 个事件循环线程
-  │   ├── SubmitTask handler               并发 RPC 处理
-  │   ├── AbortTask handler
-  │   └── GetStatus handler
-  │
-  ├── Agent Task 1 (asyncio.Task)          并发任务
-  │   ├── await client.messages.stream()   IO 等待 (释放事件循环)
-  │   ├── await emitter.emit()             IO 等待 (EventBackend.publish)
-  │   └── await sandbox.exec()             IO 等待 (Docker exec)
-  │
-  ├── Agent Task 2 (asyncio.Task)          并发任务
-  │   └── ...
-  │
-  ├── ...                                  最多 16 个并发任务
-  │
-  └── Agent Task N (asyncio.Task)
+一次 Agent 任务 (平均 30-60s) 的时间分布:
 
-关键: 90%+ 时间在 IO 等待 (LLM API)，GIL 不是问题。
-     asyncio 在 IO 等待期间自动切换到其他任务。
+  ├─ await LLM API streaming ──────────────────────────────  85% (IO 等待)
+  ├─ await sandbox.exec() / read / write ──────────────────   8% (IO 等待)
+  ├─ await emitter.emit() (Redis/Kafka) ───────────────────   3% (IO 等待)
+  ├─ await session_store.load/save (Redis/PG) ─────────────   2% (IO 等待)
+  └─ CPU 计算 (token 计数、prompt 组装、JSON 序列化) ──────   2% (CPU)
+
+  CPU 利用率极低 → 一个进程可以同时处理多个任务
+  瓶颈不在 CPU, 而在 IO 并发数和外部服务的容量
 ```
 
-### 14.2 并发上限
+如果不做并发设计，一个 Worker 进程同一时间只能处理一个用户请求，60 秒内 CPU 空闲 58 秒——这是极大的资源浪费。并发模型的目标是**让一个进程在等待 IO 的间隙处理其他请求，最大化单 Pod 的吞吐量**。
 
-| 参数 | 默认值 | 说明 |
+### 15.2 asyncio 架构
+
+Python 的 GIL 限制了多线程的 CPU 并行，但 Agent 任务是 IO 密集型（90%+ 等待），asyncio 的协作式调度恰好适合：
+
+```text
+Python 进程 (单线程 asyncio 事件循环 + uvloop)
+  │
+  ├── gRPC async server                        gRPC 框架层
+  │   ├── SubmitTask handler  ─┐
+  │   ├── AbortTask handler    │               接收请求, 分发到任务
+  │   └── GetStatus handler  ─┘
+  │
+  ├── Agent Task 1 (asyncio.Task)              ← 用户 A 的请求
+  │   ├── await client.messages.stream()       IO 等待 → 释放事件循环
+  │   ├── await sandbox.exec("npm test")       IO 等待 → 释放事件循环
+  │   └── await emitter.emit(TEXT_DELTA)       IO 等待 → 释放事件循环
+  │
+  ├── Agent Task 2 (asyncio.Task)              ← 用户 B 的请求
+  │   └── await client.messages.stream()       与 Task 1 并发等待, 互不阻塞
+  │
+  ├── ...
+  │
+  ├── Agent Task N (asyncio.Task)              ← 最多 max_concurrent_tasks 个
+  │
+  ├── Resource Monitor (后台协程)              ← 周期性上报 CPU/内存
+  │
+  └── PG 异步写入 (fire-and-forget 协程)       ← Session/Memory 冷写入
+
+  协作式调度: 每个 await 点是切换时机
+  Task 1 在等 LLM 返回 → 事件循环切到 Task 2 处理 sandbox 结果
+  Task 2 在等 sandbox → 事件循环切到 Task 3 发射事件
+  → 所有任务"交替推进", 一个进程同时服务多个用户
+```
+
+### 15.3 并发上限与衡量标准
+
+#### 15.3.1 上限参数
+
+| 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `max_concurrent_tasks` | 16 | 最大并发 Agent 任务 |
-| gRPC `maximum_concurrent_rpcs` | 50 | gRPC 层面的并发上限 |
+| `max_concurrent_tasks` | **16** | 单 Worker 最大并发 Agent 任务 |
+| `grpc.max_concurrent_rpcs` | 50 | gRPC 层面并发上限 (含非任务 RPC) |
 | `max_iterations` | 20 | 单任务最大 LLM 调用轮数 |
-| 单任务超时 | 5 分钟 | 超时自动取消 |
+| `task_timeout` | 300s (5min) | 单任务超时, 超时自动取消 |
 
-### 14.3 uvloop
+#### 15.3.2 max_concurrent_tasks = 16 的推导
+
+```text
+瓶颈分析: 什么决定了一个 Worker 能同时跑多少任务?
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  瓶颈 1: 内存                                                          │
+  │                                                                         │
+  │  每个 Agent 任务的内存占用:                                             │
+  │    messages[] 缓存          ~2-5 MB (长对话可能更大)                    │
+  │    LLM 流式响应缓冲         ~1 MB                                      │
+  │    工具执行结果缓冲          ~1-2 MB                                    │
+  │    协程栈 + 局部变量         ~0.5 MB                                    │
+  │    ───────────────────────────────                                      │
+  │    合计: ~5-10 MB / 任务                                                │
+  │                                                                         │
+  │  Pod 内存预算: 512 MB (推荐) - 128 MB (进程基础) = ~384 MB 可用        │
+  │  384 MB / 10 MB ≈ 38 个任务 (内存不是瓶颈)                             │
+  │                                                                         │
+  ├─────────────────────────────────────────────────────────────────────────┤
+  │  瓶颈 2: LLM API 并发数                                                │
+  │                                                                         │
+  │  LLM Provider 通常有 per-key 并发限制:                                  │
+  │    Anthropic: 默认 50 并发 / key                                       │
+  │    OpenAI: 按 tier, 通常 25-100 并发 / key                             │
+  │                                                                         │
+  │  多 Worker 共享 API Key → 需要预留空间                                  │
+  │  假设 4 个 Worker 共享一个 key: 50 / 4 ≈ 12 并发 / Worker             │
+  │                                                                         │
+  ├─────────────────────────────────────────────────────────────────────────┤
+  │  瓶颈 3: 沙箱容器数                                                    │
+  │                                                                         │
+  │  每个任务独占一个沙箱容器                                               │
+  │  Docker 容器 CPU 限制 1 core, Memory 256 MB                            │
+  │  Node 资源: 通常 8-16 core, 32-64 GB                                   │
+  │  单 Node 可承载: ~30-60 个容器 (取决于 Node 规格)                      │
+  │  分摊到多个 Worker: ~15-20 个 / Worker                                 │
+  │                                                                         │
+  ├─────────────────────────────────────────────────────────────────────────┤
+  │  瓶颈 4: 事件循环 CPU                                                  │
+  │                                                                         │
+  │  每个任务 ~2% CPU (JSON 序列化、token 计数)                             │
+  │  16 个并发: 16 × 2% = 32% CPU (单核)                                   │
+  │  有突发: prompt_builder 组装大型 system_prompt 可能短暂 100% CPU        │
+  │  16 个并发在突发场景下单核 CPU 接近饱和                                 │
+  │                                                                         │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  综合取最小瓶颈:
+    内存: ~38    LLM 并发: ~12    沙箱: ~15-20    CPU: ~16-20
+
+  保守值: max_concurrent_tasks = 16
+  实际部署应根据监控数据调整 (见 14.3.3)
+```
+
+#### 15.3.3 调整策略
+
+```text
+何时调高 (增加并发):
+  ─────────────────────
+  观察指标:
+    • worker_active_tasks 长期 < 8 (利用率不足 50%)
+    • CPU 使用率 < 30%
+    • 内存使用率 < 60%
+    • LLM API 无 429 错误
+  操作: max_concurrent_tasks 调到 24 或 32, 逐步观察
+
+何时调低 (减少并发):
+  ─────────────────────
+  观察指标:
+    • LLM API 频繁 429 (Rate Limit) → 并发超过了 key 额度
+    • 任务平均响应时间显著上升 → 资源争抢导致延迟
+    • 内存 OOM 或接近 Pod limit → 对话历史过大
+    • CPU 持续 > 80% → prompt 组装或 token 计数成为瓶颈
+  操作: 先定位瓶颈 (是 LLM key? 内存? CPU?), 针对性调整
+
+容量规划公式 (粗估):
+  ─────────────────────
+  需要的 Worker 数 = 峰值并发用户数 / max_concurrent_tasks
+
+  示例:
+    峰值 1000 并发 → 1000 / 16 = 63 个 Worker Pod
+    每 Pod: 1 CPU core + 512 MB memory
+    总资源: 63 cores + 32 GB memory (K8s 集群)
+
+  关键: 这是 CPU/内存估算; 真正的瓶颈通常是 LLM API key 额度。
+  假设 Anthropic key 50 并发: 1000 / 50 = 20 个 key (需要 key pool)
+```
+
+#### 15.3.4 gRPC 并发 vs Agent 任务并发
+
+```text
+为什么 gRPC max_concurrent_rpcs (50) > max_concurrent_tasks (16)?
+
+  gRPC 层接收所有类型的 RPC:
+    SubmitTask  → 创建 Agent 任务 (受 max_concurrent_tasks 限制)
+    AbortTask   → 取消任务 (瞬间完成, 不占任务槽位)
+    GetStatus   → 状态查询 (瞬间完成, 不占任务槽位)
+    SendInput   → 人机交互输入 (瞬间完成, 不占任务槽位)
+
+  如果 gRPC 层也限制为 16:
+    16 个 SubmitTask 占满 → AbortTask 无法进入 → 用户无法取消任务!
+
+  因此 gRPC 层设更高上限 (50), 任务层设实际上限 (16):
+
+  请求流量 ──→ gRPC (≤50 并发) ──→ 任务信号量 (≤16 Agent 任务)
+                  │                       │
+                  └── Abort/Status 直接处理  └── SubmitTask 受限
+```
+
+### 15.4 任务生命周期与背压
+
+```python
+# sahara_runtime/worker.py (简化)
+
+class Worker:
+    def __init__(self, config: RuntimeConfig):
+        self._semaphore = asyncio.Semaphore(config.max_concurrent_tasks)
+        self.active_tasks = 0
+
+    async def submit_task(self, request: SubmitTaskRequest) -> None:
+        """提交任务, 受信号量控制。"""
+        if not self._semaphore.locked():
+            # 有空闲槽位 → 立即执行
+            pass
+        else:
+            # 无空闲槽位 → gRPC 返回 RESOURCE_EXHAUSTED
+            # Gateway 收到后将任务路由到其他 Worker
+            raise ResourceExhaustedError("worker at capacity")
+
+        async with self._semaphore:
+            self.active_tasks += 1
+            try:
+                await run_agent_loop(...)
+            finally:
+                self.active_tasks -= 1
+```
+
+```text
+背压传导链:
+
+  所有 Worker 满载
+       ↓
+  Gateway 收到 RESOURCE_EXHAUSTED
+       ↓
+  Gateway 无可用 Worker → 返回 503 给 API Service
+       ↓
+  API Service 返回 HTTP 503 给客户端
+       ↓
+  客户端显示 "服务繁忙, 请稍后重试"
+
+  关键: Worker 不排队等待, 而是立即拒绝。
+  排队由 Gateway 层或 API 层控制, Runtime 保持简单。
+```
+
+### 15.5 uvloop
 
 ```python
 # sahara_runtime/main.py
@@ -6021,52 +7731,586 @@ Python 进程 (单线程 asyncio 事件循环)
 import uvloop
 
 def main():
-    uvloop.install()  # 替换默认事件循环，性能提升 2-4x
+    uvloop.install()  # 替换默认事件循环, 性能提升 2-4x
     asyncio.run(start_server())
 ```
 
+uvloop 是 libuv 的 Python 绑定，替换 asyncio 默认事件循环后：
+- IO 调度延迟降低 50%+
+- 高并发下吞吐量提升 2-4x
+- 对业务代码完全透明（无需修改任何 `await` 调用）
+
 ---
 
-## 十五、错误处理与弹性
+## 十六、错误处理与弹性
 
-### 15.1 错误分类
+> Agent 任务涉及多个外部系统（LLM API、沙箱、Redis、PG），每一个都可能失败。
+> 错误处理的核心原则：**能重试的重试，不能重试的快速失败并告知用户，所有错误都通过 Event Bus 通知客户端。**
 
-| 错误类型 | 处理策略 | 示例 |
+### 16.1 错误全景图
+
+```text
+Agent 任务执行中可能遇到的所有错误及其流转:
+
+  ┌──── 错误发生点 ────────────────── 处理策略 ───────────── Event Bus 通知 ────┐
+  │                                                                            │
+  │  LLM API                                                                   │
+  │  ├── 429 Rate Limit             指数退避重试 (3 次)      无 (静默重试)      │
+  │  ├── 503 Service Unavailable    指数退避重试 (3 次)      无 (静默重试)      │
+  │  ├── 529 Overloaded             指数退避重试 (3 次)      无 (静默重试)      │
+  │  ├── 401/403 Auth Failed        Key 轮换 → 熔断该 Key   RUN_ERROR          │
+  │  ├── 400 Invalid Request        不重试, 直接报错         RUN_ERROR          │
+  │  ├── Context Overflow           Context Manager → 重试   无 (静默处理)      │
+  │  ├── 流式断开 (网络中断)        重试 1 次               无 / RUN_ERROR     │
+  │  └── 重试全部耗尽              ──→ 兜底 ──→             RUN_ERROR          │
+  │                                                                            │
+  │  工具执行                                                                   │
+  │  ├── 命令报错 (exit != 0)       错误文本 → 给 LLM 决策   TOOL_RESULT (error) │
+  │  ├── 超时 (30s)                 超时文本 → 给 LLM 决策   TOOL_RESULT (error) │
+  │  ├── 路径越权                   拒绝 → 给 LLM 决策       TOOL_RESULT (error) │
+  │  └── 未知异常                   错误文本 → 给 LLM 决策   TOOL_RESULT (error) │
+  │                                                                            │
+  │  沙箱                                                                      │
+  │  ├── 容器创建失败               中止任务                 RUN_ERROR          │
+  │  ├── 容器 OOM                   重新分配容器 → 重试      无 / RUN_ERROR     │
+  │  └── Docker Daemon 不响应       中止任务                 RUN_ERROR          │
+  │                                                                            │
+  │  Session / Redis                                                           │
+  │  ├── Redis 连接断开             重试 3 次 → 中止任务     RUN_ERROR          │
+  │  ├── Session 锁冲突             gRPC 返回 ABORTED        (无任务, 无事件)   │
+  │  └── PG 异步写入失败            记录日志, 不影响用户     无 (PG 补偿)       │
+  │                                                                            │
+  │  任务级                                                                    │
+  │  ├── 超时 (5min)                取消任务                 RUN_ERROR          │
+  │  ├── 用户主动取消               优雅取消                 RUN_ABORT          │
+  │  ├── 迭代次数超限 (20轮)        正常结束                 RUN_COMPLETE       │
+  │  └── 未捕获异常                 记录堆栈 → 中止          RUN_ERROR          │
+  │                                                                            │
+  │  Event Bus 本身                                                            │
+  │  ├── Redis XADD 失败            重试 1 次 → 丢弃 (不阻塞主流程)           │
+  │  └── Kafka/NATS 不可用          缓冲 + 重试 → 超时丢弃                     │
+  │                                                                            │
+  └────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 16.2 错误分类与处理原则
+
+| 分类 | 处理原则 | 用户感知 |
 | --- | --- | --- |
-| **LLM 暂时不可用** (429/503) | 重试 + 指数退避 (最多 3 次) | Rate Limit、Provider 过载 |
-| **LLM 认证失败** (401/403) | Key 轮换 → 熔断该 Key | API Key 过期/无效 |
-| **上下文溢出** | Layer 4 紧急压缩 → 重试 | messages 超过 context window |
-| **工具执行失败** | 返回错误文本给 LLM (让 LLM 决策) | exec 命令报错 |
-| **沙箱不可用** | 发射 RUN_ERROR → 中止任务 | Docker 容器创建失败 |
-| **Session 锁冲突** | gRPC 返回 ABORTED | 同一 session 并发请求 |
-| **任务被取消** | asyncio.CancelledError → 清理 | 用户中止 / Gateway 断连 |
+| **可重试 (Retryable)** | 指数退避重试, 用户无感知 | 无感, 略有延迟 |
+| **可恢复 (Recoverable)** | 自动降级/切换后继续 | 无感或轻微影响 |
+| **可容忍 (Tolerable)** | 交给 LLM 自行处理 | LLM 会告知用户 |
+| **致命 (Fatal)** | 中止任务, 通知用户 | 显示错误信息 |
 
-### 15.2 LLM 调用重试
+### 16.3 LLM 调用重试 (指数退避 + 兜底)
 
 ```python
-async def _call_llm_with_retry(client, model, **kwargs):
-    """带重试的 LLM 调用"""
-    max_retries = 3
+# sahara_runtime/llm/retry.py
+
+class LLMCallError(Exception):
+    """LLM 调用错误, 包含是否可重试的标记。"""
+    def __init__(self, message: str, retryable: bool = False,
+                 status_code: int = 0):
+        super().__init__(message)
+        self.retryable = retryable
+        self.status_code = status_code
+
+
+async def call_llm_with_retry(
+    client,
+    model: str,
+    system_prompt: str,
+    messages: list[dict],
+    tools: list[dict],
+    emitter: "RunEmitter",
+    *,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+) -> "StreamResponse":
+    """带指数退避和兜底的 LLM 调用。
+
+    重试策略:
+      尝试 1: 立即调用
+      尝试 2: 等待 1-2s   (base_delay * 2^0 + jitter)
+      尝试 3: 等待 2-5s   (base_delay * 2^1 + jitter)
+      全部失败: 抛出 LLMCallError → Agent Loop 捕获 → 发射 RUN_ERROR
+
+    可重试的错误:
+      429 Rate Limit        — LLM 过载, 等一下通常能恢复
+      503 Service Unavailable — Provider 临时不可用
+      529 Overloaded         — Anthropic 特有的过载状态码
+      网络超时 / 连接重置    — 网络抖动
+
+    不重试的错误:
+      401/403 Auth Failed    — Key 问题, 重试无意义, 走 Key 轮换
+      400 Invalid Request    — 请求参数有误, 重试无意义
+      其他 4xx               — 客户端错误, 不应重试
+    """
+    last_error: Exception | None = None
+
     for attempt in range(max_retries):
         try:
-            return await _call_llm_streaming(client, model, **kwargs)
-        except RateLimitError:
-            if attempt == max_retries - 1:
-                raise
-            wait = 2 ** attempt + random.uniform(0, 1)
-            logger.warning(f"rate limited, retry in {wait:.1f}s", extra={
-                "attempt": attempt, "model": model,
-            })
-            await asyncio.sleep(wait)
-        except AuthenticationError:
-            # Key 失效 → 轮换
-            await kwargs["deps"].key_pool.report_error(key, 401)
-            raise LLMProviderError("auth failed", retryable=True)
+            response = await _call_llm_streaming(
+                client, model, system_prompt, messages, tools,
+            )
+            # 成功 → 如果之前有重试, 记录恢复日志
+            if attempt > 0:
+                logger.info("llm_call_recovered",
+                            attempt=attempt, model=model)
+            return response
+
+        except RateLimitError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                delay = _exponential_backoff(attempt, base_delay, max_delay)
+                logger.warning("llm_rate_limited",
+                               attempt=attempt + 1, max_retries=max_retries,
+                               retry_in=f"{delay:.1f}s", model=model)
+                await asyncio.sleep(delay)
+            # 最后一次失败 → 跳出循环, 走兜底
+
+        except ServiceUnavailableError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                delay = _exponential_backoff(attempt, base_delay, max_delay)
+                logger.warning("llm_service_unavailable",
+                               attempt=attempt + 1, retry_in=f"{delay:.1f}s")
+                await asyncio.sleep(delay)
+
+        except ConnectionError as e:
+            # 网络层错误 (TCP reset, DNS 失败, 超时等)
+            last_error = e
+            if attempt < max_retries - 1:
+                delay = _exponential_backoff(attempt, base_delay, max_delay)
+                logger.warning("llm_connection_error",
+                               attempt=attempt + 1, error=str(e))
+                await asyncio.sleep(delay)
+
+        except StreamInterruptedError as e:
+            # 流式响应中途断开 (LLM 返回了一部分就断了)
+            last_error = e
+            if attempt < max_retries - 1:
+                logger.warning("llm_stream_interrupted",
+                               attempt=attempt + 1, partial_tokens=e.tokens_received)
+                await asyncio.sleep(1.0)  # 短暂等待后重试
+
+        except AuthenticationError as e:
+            # 不重试 → 立即上报 Key 失效, 走 Key 轮换
+            logger.error("llm_auth_failed", model=model, key_prefix=key[:8])
+            raise LLMCallError(
+                f"LLM authentication failed: {e}",
+                retryable=False, status_code=401,
+            )
+
+        except InvalidRequestError as e:
+            # 不重试 → 请求参数有误 (可能是 prompt 构造 bug)
+            logger.error("llm_invalid_request", model=model, error=str(e))
+            raise LLMCallError(
+                f"LLM invalid request: {e}",
+                retryable=False, status_code=400,
+            )
+
+    # ── 兜底: 所有重试耗尽 ──
+    error_msg = f"LLM call failed after {max_retries} attempts: {last_error}"
+    logger.error("llm_retries_exhausted",
+                 max_retries=max_retries, model=model,
+                 last_error=str(last_error))
+    raise LLMCallError(error_msg, retryable=False)
+
+
+def _exponential_backoff(attempt: int, base: float, max_delay: float) -> float:
+    """指数退避 + 随机抖动, 防止惊群效应。
+
+    attempt=0: base * 1  + jitter = 1.0 ~ 2.0s
+    attempt=1: base * 2  + jitter = 2.0 ~ 4.0s
+    attempt=2: base * 4  + jitter = 4.0 ~ 8.0s
+    ...
+    cap at max_delay
+    """
+    delay = min(base * (2 ** attempt), max_delay)
+    jitter = random.uniform(0, delay)  # [0, delay) 的随机抖动
+    return delay + jitter
+```
+
+### 16.4 错误 → Event Bus 通知链路
+
+所有终态（成功/失败/取消）都必须通过 Event Bus 通知客户端，否则用户会看到永久的 "执行中" 状态。
+
+```text
+Agent Loop 中的错误捕获与事件发射:
+
+  run_agent_loop()
+      │
+      ├── 正常完成
+      │   └── emitter.emit_run_complete(final_text, iterations)
+      │       → EventType: RUN_COMPLETE
+      │       → 客户端显示: 执行完成
+      │
+      ├── LLMCallError (重试耗尽)
+      │   └── emitter.emit_run_error(str(e), retryable=False)
+      │       → EventType: RUN_ERROR
+      │       → payload: { error_message, retryable: false }
+      │       → 客户端显示: "AI 服务暂时不可用, 请稍后重试"
+      │
+      ├── LLMCallError (Auth, 可重试 via Key 轮换)
+      │   └── emitter.emit_run_error(str(e), retryable=True)
+      │       → EventType: RUN_ERROR
+      │       → payload: { error_message, retryable: true }
+      │       → 客户端可自动重试 (新的 SubmitTask)
+      │
+      ├── 上下文溢出 (Context Manager 处理后仍超限)
+      │   └── emitter.emit_run_error("context overflow", retryable=False)
+      │       → EventType: RUN_ERROR
+      │       → 客户端显示: "对话过长, 建议开启新会话"
+      │
+      ├── 沙箱不可用
+      │   └── emitter.emit_run_error("sandbox unavailable", retryable=True)
+      │       → EventType: RUN_ERROR
+      │       → Gateway 可路由到其他 Worker 重试
+      │
+      ├── 任务超时 (asyncio.TimeoutError)
+      │   └── emitter.emit_run_error("task timeout (300s)", retryable=False)
+      │       → EventType: RUN_ERROR
+      │       → 客户端显示: "任务执行超时"
+      │
+      ├── 用户取消 (asyncio.CancelledError)
+      │   └── emitter.emit_abort(reason="user_cancelled")
+      │       → EventType: RUN_ABORT
+      │       → 客户端显示: "已取消"
+      │
+      └── 未捕获异常 (兜底)
+          └── emitter.emit_run_error(f"internal error: {e}", retryable=False)
+              → EventType: RUN_ERROR
+              → 客户端显示: "服务异常, 请稍后重试"
+              → 同时 logger.exception() 记录完整堆栈
+```
+
+```python
+# Agent Loop 中的错误捕获结构 (简化):
+
+async def run_agent_loop(session_key, agent_id, task, deps, emitter):
+    try:
+        # ... 正常执行 ...
+        await emitter.emit_run_complete(final_text, iterations)
+
+    except asyncio.TimeoutError:
+        await emitter.emit_run_error("task timeout exceeded", retryable=False)
+
+    except asyncio.CancelledError:
+        await emitter.emit_abort(reason="cancelled")
+
+    except LLMCallError as e:
+        await emitter.emit_run_error(str(e), retryable=e.retryable)
+
+    except SandboxError as e:
+        await emitter.emit_run_error(f"sandbox error: {e}", retryable=True)
+
+    except Exception as e:
+        # 兜底: 所有未预期的错误
+        logger.exception("agent_loop_unexpected_error", session_key=session_key)
+        await emitter.emit_run_error(f"internal error: {type(e).__name__}", retryable=False)
+
+    finally:
+        # 无论成功/失败, 都保存会话和释放资源
+        await deps.session_store.save(session)
+        await deps.sandbox_manager.release(sandbox)
+```
+
+### 16.5 工具执行错误处理
+
+工具错误**不中止任务**——错误文本作为 `tool_result` 返回给 LLM，由 LLM 自行决策（换命令/换方案/告知用户）：
+
+```text
+工具错误处理流程:
+
+  LLM 请求: exec("rm -rf /important")
+      │
+      ▼
+  ToolExecutor 执行
+      │
+      ├── 路径越权 → ToolExecutionError("Access denied: path outside workspace")
+      ├── 命令超时 → "Tool exec timed out after 30s"
+      ├── 命令报错 → "Exit code 1: Permission denied"
+      └── 未知异常 → "Unexpected error: TypeError: ..."
+      │
+      ▼
+  tool_result = { role: "tool", content: <错误文本>, is_error: true }
+      │
+      ├── emitter.emit_tool_result(tool_name, result, success=false)
+      │   → EventType: TOOL_RESULT
+      │   → 客户端显示: 工具执行失败图标
+      │
+      └── 送回 LLM → LLM 看到错误 → 自行决策
+          │
+          ├── "命令报错了, 让我换个方式..."  → 重新调用工具
+          ├── "权限不足, 需要用 sudo..."     → 换命令
+          └── "抱歉, 这个操作无法完成..."    → 告知用户
+```
+
+### 16.6 Event Bus 自身的弹性
+
+Event Bus 发布失败不应阻塞 Agent 任务——事件通知是"尽力而为"，而非关键路径：
+
+```python
+# RunEmitter._emit() 中的弹性逻辑:
+
+async def _emit(self, event_type: EventType, **payload):
+    """发射事件到 Event Bus。失败不阻塞主流程。"""
+    event = self._build_event(event_type, payload)
+    try:
+        await asyncio.wait_for(
+            self._backend.publish(self._stream_key, event),
+            timeout=2.0,  # 最多等 2 秒
+        )
+    except asyncio.TimeoutError:
+        logger.warning("event_publish_timeout",
+                       event_type=event_type.name, stream=self._stream_key)
+        # 不重试, 不阻塞 → 客户端可能丢失此事件, 但任务继续
+    except Exception as e:
+        logger.warning("event_publish_failed",
+                       event_type=event_type.name, error=str(e))
+        # 同上: 记录日志但不影响任务执行
+
+    # 例外: 终态事件 (RUN_COMPLETE / RUN_ERROR / RUN_ABORT) 重试 1 次
+    # 因为终态丢失会导致客户端永久 "执行中"
+    if event_type in TERMINAL_EVENTS and not published:
+        await asyncio.sleep(0.5)
+        try:
+            await asyncio.wait_for(
+                self._backend.publish(self._stream_key, event),
+                timeout=2.0,
+            )
+        except Exception:
+            logger.error("terminal_event_publish_failed",
+                         event_type=event_type.name,
+                         run_id=self._run_id)
+            # 最终兜底: Gateway 的超时机制会清理 "僵尸" 任务状态
+```
+
+### 16.7 LLM 调用重试参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `llm_max_retries` | 3 | 最大重试次数 (含首次调用共 3 次) |
+| `llm_retry_base_delay` | 1.0s | 指数退避基础延迟 |
+| `llm_retry_max_delay` | 30.0s | 退避上限 (防止等太久) |
+| `llm_stream_timeout` | 120s | 单次 LLM 流式调用超时 |
+
+```text
+重试时序示例 (429 Rate Limit):
+
+  t=0.0s    尝试 1: 调用 LLM API
+  t=0.1s    收到 429 Rate Limit
+  t=0.1s    计算退避: 1.0 * 2^0 + jitter = 1.0~2.0s → 等 1.3s
+  t=1.4s    尝试 2: 调用 LLM API
+  t=1.5s    收到 429 Rate Limit
+  t=1.5s    计算退避: 1.0 * 2^1 + jitter = 2.0~4.0s → 等 3.1s
+  t=4.6s    尝试 3: 调用 LLM API
+  t=5.0s    ✓ 成功! (Provider 恢复了)
+            → 用户完全无感知, 总延迟 ~5s
+
+  如果尝试 3 也失败:
+  t=5.1s    兜底: raise LLMCallError("failed after 3 attempts")
+            → emitter.emit_run_error(..., retryable=False)
+            → 客户端显示错误
+```
+
+### 16.8 API Key 轮换与熔断
+
+LLM API Key 不是一个而是一个 **Key Pool**。单个 Key 失效时自动切换，不影响其他任务：
+
+```python
+# sahara_runtime/llm/key_pool.py
+
+class KeyState(Enum):
+    HEALTHY = "healthy"       # 正常可用
+    DEGRADED = "degraded"     # 触发过限流, 降低权重
+    CIRCUIT_OPEN = "open"     # 熔断, 暂时不可用
+    DISABLED = "disabled"     # 永久禁用 (401/403)
+
+
+class KeyPool:
+    """API Key 池管理。支持轮换、熔断、自动恢复。"""
+
+    def __init__(self, keys: list[KeyConfig]):
+        self._keys: dict[str, KeyEntry] = {
+            k.key_id: KeyEntry(config=k, state=KeyState.HEALTHY)
+            for k in keys
+        }
+
+    def select(self, provider: str, session_key: str | None = None) -> str:
+        """选择一个可用的 Key。
+
+        策略:
+          1. 优先复用 session 绑定的 Key (缓存亲和, 见 §6)
+          2. 如果绑定 Key 不可用, 选择同 provider 下健康 Key
+          3. 所有 Key 不可用 → raise NoAvailableKeyError
+        """
+        ...
+
+    async def report_error(self, key_id: str, status_code: int):
+        """上报 Key 错误, 触发状态迁移。"""
+        entry = self._keys[key_id]
+
+        if status_code in (401, 403):
+            # 认证失败 → 永久禁用
+            entry.state = KeyState.DISABLED
+            logger.error("key_disabled", key_id=key_id[:8], reason="auth_failed")
+
+        elif status_code == 429:
+            entry.error_count += 1
+            if entry.error_count >= 3:
+                # 连续 3 次限流 → 熔断
+                entry.state = KeyState.CIRCUIT_OPEN
+                entry.circuit_open_until = time.monotonic() + 60  # 60 秒后半开
+                logger.warning("key_circuit_open", key_id=key_id[:8])
+            else:
+                entry.state = KeyState.DEGRADED
+
+    async def _half_open_check(self):
+        """定时检查熔断的 Key 是否可恢复 (半开 → 健康)。
+
+        每 30s 运行一次, 对 CIRCUIT_OPEN 状态的 Key:
+          如果已超过 circuit_open_until → 状态改为 DEGRADED (半开)
+          下次选中时如果成功 → 恢复为 HEALTHY
+          如果再次失败 → 重新 CIRCUIT_OPEN, 超时翻倍 (最大 5 min)
+        """
+        ...
+```
+
+```text
+Key 状态机:
+
+  HEALTHY ───429×3───→ CIRCUIT_OPEN ───超时───→ DEGRADED (半开)
+     ↑                                              │
+     │                     ┌────────────────────────┘
+     │                     ▼
+     └───── 成功一次 ── DEGRADED ──再次失败──→ CIRCUIT_OPEN
+                                                (超时翻倍)
+
+  401/403 → DISABLED (永久, 需人工介入更换 Key)
+```
+
+### 16.9 模型降级与 Fallback 系统
+
+> **完整设计见 → [§6.8 Fallback 系统 (多层容错)](#68-fallback-系统-多层容错)**
+
+模型降级是 Fallback 系统四层防线的**第四层（最后手段）**。摘要：
+
+```text
+四层防线 (由浅入深, 缓存损失递增):
+
+  第一层: 同 Key 重试 (429/5xx/超时)                 → 缓存完整保留
+  第二层: Key 轮转 (401/403/402)                     → 缓存丢失
+  第三层: 上下文压缩 + Thinking 降级                  → 可能保留缓存
+  第四层: 模型降级链 (换 Model + 换 Key)              → 缓存完全丢失
+
+  claude-sonnet ──失败──→ gpt-4o ──失败──→ claude-haiku ──失败──→ RUN_ERROR
+```
+
+核心组件：`FailoverReason` (错误分类) + `FallbackRunner` (执行引擎) + `FallbackChainConfig` (配置)。
+
+### 16.10 异常层次与统一错误体系
+
+```python
+# sahara_runtime/errors.py
+
+class SaharaRuntimeError(Exception):
+    """Runtime 所有自定义异常的基类。"""
+    def __init__(self, message: str, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+class LLMCallError(SaharaRuntimeError):
+    """LLM API 调用错误。"""
+    def __init__(self, message: str, retryable: bool = False, status_code: int = 0):
+        super().__init__(message, retryable)
+        self.status_code = status_code
+
+
+class ToolExecutionError(SaharaRuntimeError):
+    """工具执行错误。"""
+    pass
+
+
+class SandboxError(SaharaRuntimeError):
+    """沙箱操作错误。"""
+    pass
+
+class SandboxUnavailableError(SandboxError):
+    """沙箱不可用 (无法创建/连接)。"""
+    def __init__(self, message: str):
+        super().__init__(message, retryable=True)
+
+class SandboxTimeoutError(SandboxError):
+    """沙箱操作超时。"""
+    pass
+
+class SandboxOOMError(SandboxError):
+    """沙箱 OOM。"""
+    def __init__(self, message: str):
+        super().__init__(message, retryable=True)
+
+
+class SessionLockConflictError(SaharaRuntimeError):
+    """Session 锁冲突。"""
+    def __init__(self, session_key: str):
+        super().__init__(f"Session {session_key} is locked by another task",
+                         retryable=False)
+
+
+class TaskTimeoutError(SaharaRuntimeError):
+    """任务超时。"""
+    pass
+
+
+class ContextOverflowError(SaharaRuntimeError):
+    """上下文溢出 (Context Manager 处理后仍超限)。"""
+    pass
+
+
+class NoAvailableKeyError(LLMCallError):
+    """所有 API Key 不可用。"""
+    def __init__(self):
+        super().__init__("No available API key", retryable=False, status_code=0)
+```
+
+### 16.11 弹性总结
+
+```text
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                     错误处理与弹性 — 防御体系                          │
+  │                                                                         │
+  │  Layer 1: 自动重试                                                     │
+  │    └── LLM 指数退避 (3 次) + 网络层重试                                │
+  │                                                                         │
+  │  Layer 2: 自动恢复                                                     │
+  │    ├── Key 轮换: 单 Key 失败 → 自动切换健康 Key                        │
+  │    ├── Key 熔断: 连续失败 → 熔断 60s → 半开探测 → 恢复                 │
+  │    ├── 模型降级: 主模型不可用 → 备选模型链                              │
+  │    └── 上下文溢出: ContextManager 四策略编排 → 重试                     │
+  │                                                                         │
+  │  Layer 3: LLM 自愈                                                     │
+  │    └── 工具错误返回 LLM → LLM 自行调整策略                             │
+  │                                                                         │
+  │  Layer 4: 快速失败 + 通知                                              │
+  │    ├── 不可恢复错误 → RUN_ERROR event → 客户端提示                      │
+  │    ├── 用户取消 → RUN_ABORT event → 客户端确认                          │
+  │    └── 终态事件重试 1 次 → Gateway 超时兜底                             │
+  │                                                                         │
+  │  Layer 5: 可观测性                                                     │
+  │    ├── 结构化日志: 每个错误带 run_id, session_key, model, attempt       │
+  │    ├── Prometheus: llm_retry_total, key_circuit_open_total, ...         │
+  │    └── 全链路: 错误 → 日志 + 指标 + Event Bus → 运维/用户都能感知      │
+  │                                                                         │
+  └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 十六、配置管理
+## 十七、配置管理
 
 ```python
 # sahara_runtime/config.py
@@ -6097,6 +8341,15 @@ class RuntimeConfig(BaseSettings):
     max_iterations: int = 20
     max_tokens: int = 8192
 
+    # LLM 重试与弹性 (详见 §16)
+    llm_max_retries: int = 3               # LLM 调用最大重试次数
+    llm_retry_base_delay: float = 1.0      # 指数退避基础延迟 (秒)
+    llm_retry_max_delay: float = 30.0      # 退避上限 (秒)
+    llm_stream_timeout: int = 120          # 单次 LLM 流式调用超时 (秒)
+    key_circuit_open_duration: int = 60    # Key 熔断持续时间 (秒)
+    key_circuit_max_duration: int = 300    # Key 熔断最大持续时间 (秒, 翻倍上限)
+    key_error_threshold: int = 3           # 连续错误次数触发熔断
+
     # Sandbox (可插拔后端, 详见 §9)
     sandbox_enabled: bool = True
     sandbox_runtime: str = "docker"   # "docker" / "gvisor" / "firecracker" / "remote" / "noop"
@@ -6106,8 +8359,8 @@ class RuntimeConfig(BaseSettings):
 
     # Skills
     bundled_skills_dir: str = "/app/skills/bundled"
-    managed_skills_dir: str = ""          # 平台托管技能目录 (可选)
-    workspace_skills_dir: str = ""        # 工作空间技能目录 (可选)
+    configured_skills_dir: str = ""       # 业务配置技能目录 (可选, Phase 2)
+    managed_skills_dir: str = ""          # 平台托管技能目录 (可选, Phase 2)
     disabled_skills: list[str] = []       # 显式禁用的技能名列表
 
     # Event Bus (可插拔后端, 详见 §5)
@@ -6123,82 +8376,110 @@ class RuntimeConfig(BaseSettings):
 
 ---
 
-## 十七、可观测性
+## 十八、可观测性
 
-### 17.1 structlog 日志
+> 可观测性是横切关注点，需要从**整个项目架构**视角统一设计，已抽离为独立文档。
+>
+> **详细设计见 → [可观测性架构设计](./OBSERVABILITY-DESIGN.md)**
 
-```python
-# sahara_runtime/main.py
+本节仅保留与 Runtime 其他章节交叉引用所需的要点摘要：
 
-import structlog
-
-structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.JSONRenderer(),
-    ],
-)
-
-logger = structlog.get_logger()
-
-# 使用
-logger.info("task_started", run_id=run_id, session_key=session_key, model=model)
-logger.info("llm_call_complete", run_id=run_id, iteration=iteration, tokens=usage.total)
-logger.warning("tool_execution_failed", tool=tool_name, error=str(e))
-```
-
-### 17.2 Prometheus 指标
-
-```python
-from prometheus_client import Counter, Histogram, Gauge
-
-# 任务
-tasks_active = Gauge("sahara_rt_tasks_active", "Active agent tasks")
-tasks_total = Counter("sahara_rt_tasks_total", "Total tasks", ["status"])
-
-# LLM
-llm_call_duration = Histogram("sahara_rt_llm_call_seconds", "LLM call duration",
-                               ["provider", "model"])
-llm_tokens_total = Counter("sahara_rt_llm_tokens_total", "Tokens used",
-                            ["provider", "model", "direction"])
-llm_errors_total = Counter("sahara_rt_llm_errors_total", "LLM errors",
-                            ["provider", "error_type"])
-
-# 工具
-tool_execution_duration = Histogram("sahara_rt_tool_seconds", "Tool execution duration",
-                                     ["tool"])
-tool_errors_total = Counter("sahara_rt_tool_errors_total", "Tool errors", ["tool"])
-
-# 沙箱
-sandbox_pool_idle = Gauge("sahara_rt_sandbox_pool_idle", "Idle sandbox containers")
-sandbox_pool_in_use = Gauge("sahara_rt_sandbox_pool_in_use", "In-use sandbox containers")
-
-# 事件
-events_emitted_total = Counter("sahara_rt_events_emitted_total", "Events emitted",
-                                ["type"])
-```
+- **三支柱**: Metrics (Prometheus) + Logs (structlog JSON) + Traces (OpenTelemetry, Phase 2)
+- **关联键**: `run_id` / `session_key` / `worker_id` / `trace_id` 贯穿所有维度
+- **Runtime 指标前缀**: `sahara_rt_{子系统}_{指标名}_{单位}`
+- **8 层指标体系**: Task → LLM → Tool → Sandbox → Context → Memory → Event → Infra
+- **结构化日志**: `structlog` + `contextvars` 自动注入上下文, JSON 输出
+- **Phase 1 范围**: Prometheus 8 层指标 + structlog JSON 结构化日志
+- **Phase 2 范围**: OpenTelemetry 分布式追踪 (Gateway → Runtime → LLM API)
 
 ---
 
-## 十八、Phase 1 最小实现范围
+## 十九、安全架构总览
+
+> 安全措施分散在各子系统中实现（纵深防御），本节汇总全局视图。
+
+### 19.1 安全分层模型
+
+```text
+安全纵深防御 (由外向内):
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Layer 1: 入口层 — gRPC 认证与鉴权                                   │
+  │  ├── Gateway 已完成 JWT 验证, Runtime 信任 Gateway 的 metadata       │
+  │  ├── 幂等性检查 (防重复提交)                                         │
+  │  └── Session 分布式锁 (防并发写入)                         §3, §12  │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │  Layer 2: 提示词层 — 注入防护                                        │
+  │  ├── Safety Rules 段落不可被 Agent 配置覆盖 (硬编码)       §8.3     │
+  │  ├── 用户上传 SKILL.md 注入检测 (Phase 3)                 §10.10   │
+  │  └── Context Files 大小限制 (10K 字符)                     §8.3     │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │  Layer 3: 工具层 — 执行控制                                          │
+  │  ├── ToolPolicy: allowlist / blocklist / 分层禁用          §7.6     │
+  │  ├── 高危操作确认机制 (rm -rf, sudo, 敏感文件)             §4.4     │
+  │  ├── 路径安全: 所有 read/write 限制在 /workspace 内        §7.11    │
+  │  └── 输出截断: 防止巨大输出撑爆上下文                      §7.9     │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │  Layer 4: 沙箱层 — 隔离执行                                          │
+  │  ├── Docker namespace/cgroup 隔离 (Phase 1)                §9       │
+  │  ├── 非 root 用户执行, seccomp + capabilities 限制        §9       │
+  │  ├── gVisor 内核级隔离 (Phase 2), Firecracker VM (Phase 3) §9       │
+  │  ├── 资源配额: CPU / Memory / Disk / 进程数               §9       │
+  │  └── 网络隔离: 默认禁用, 按需开启                          §9       │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │  Layer 5: 数据层 — 隔离与保护                                        │
+  │  ├── Session 按 user_id:agent_id:session_id 隔离          §12      │
+  │  ├── 长期记忆按 (user_id, agent_id) 多租户隔离            §12      │
+  │  ├── API Key 不记入日志 (仅前 8 位)                        §6       │
+  │  └── Event Bus 按 session_key 路由, 不跨 session 读取     §5       │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │  Layer 6: 运维层 — 可观测与审计                                      │
+  │  ├── 结构化日志 (所有操作含 run_id + session_key)          §18      │
+  │  ├── 工具调用审计 (TOOL_START / TOOL_RESULT 事件)          §5.7     │
+  │  ├── 人机交互审计 (INPUT_REQUIRED 事件)                    §5.7     │
+  │  └── 异常告警 (Key 熔断、任务超时、沙箱崩溃)              §16, §18 │
+  └─────────────────────────────────────────────────────────────────────┘
+```
+
+### 19.2 关键安全原则
+
+| 原则 | 说明 | 实现章节 |
+| --- | --- | --- |
+| **最小权限** | 沙箱内非 root, 只写 /workspace, 默认无网络 | §9 |
+| **纵深防御** | 即使 LLM 被 jailbreak, 沙箱 + 工具策略仍然有效 | §7, §9 |
+| **快速失败** | 认证错误不重试, Key 失效立即熔断 | §6, §16 |
+| **审计可追溯** | 每个工具调用都有事件记录, 可回放完整操作链 | §5.7, §18 |
+| **隔离边界** | Session 间完全隔离, 不共享文件系统和内存 | §9, §12 |
+| **安全不可覆盖** | Safety Rules 硬编码, 用户/Agent 配置无法关闭 | §8.3 |
+
+### 19.3 Phase 规划
+
+| Phase | 安全增强 |
+| --- | --- |
+| **Phase 1** | Docker 隔离 + ToolPolicy + 路径安全 + 确认机制 + 结构化日志 |
+| **Phase 2** | gVisor 内核级隔离 + SKILL.md 注入检测 + 分布式追踪 |
+| **Phase 3** | Firecracker VM 隔离 + 用户上传安全审核 + 安全审计 Dashboard |
+
+---
+
+## 二十、Phase 1 最小实现范围
 
 | 模块 | Phase 1 范围 | 可推迟 |
 | --- | --- | --- |
 | **gRPC Server** | ★ SubmitTask + AbortTask + GetStatus + GetTaskStatus + Health | SendInput, ListActiveTasks, Drain |
 | **Agent Loop** | ★ 完整 LLM 交互循环 + 任务超时 + 重试 (Anthropic SDK) | 人机交互(§4.4), OpenAI SDK, 并行工具执行 |
 | **EventEmitter** | ★ EventBackend 抽象 + RedisStreamsBackend (11 种事件 + ResilientEmitter 弹性) + InMemoryBackend (测试) | Kafka/NATS 后端, CompositeBackend 双写迁移 |
-| **Model Router** | 简化：单 Provider + 单 Key + Key 刷新 | Key 池, 轮换, 熔断, 降级重试 |
+| **Model Router** | ★ 单 Provider (Anthropic) + Key 池 (轮换 + 熔断) + Session 亲和 + Fallback 第一/二层 (同 Key 重试 + Key 轮转) + 错误分类 (`FailoverReason`) | 模型降级链 (第四层), 多 Provider (ProviderAdapter), Thinking 降级, 上下文溢出恢复 |
 | **Tools** | ★ exec + read + write (Tier 0) + ToolExecutor (串行) + 超时 + 截断 + 路径安全 + ToolTier 排序 | Tier 1 (edit/glob/grep), Tier 2 (web_*), Tier 3 (Plugin), 确认, 并行执行, 预算裁剪 |
 | **Prompt Builder** | ★ 4 段落 (身份 + 安全 + 工具指南 + 运行时), PromptBuilder 基础骨架, 无缓存 | 技能段落, 沙箱段落, 上下文文件, 自定义指令, 段落缓存, 预算控制 |
-| **Session Store** | ★ Redis 热存储 + 分布式锁 + PG 异步写入 | 历史分页 |
-| **Context Manager** | ★ Layer 1 输入截断 + Layer 2 剪枝 + Layer 4 紧急回退 | Layer 3 LLM 压缩 |
+| **Agent Memory** | ★ SessionStore (Redis 热 + PG 冷) + SessionLock (分布式锁) + SessionMeta + Token 统计 | Knowledge Store (pgvector 长期记忆), memory_search/memory_save 工具, 会话自动提取, Embedder |
+| **Context Manager** | ★ Filtering (规则过滤) + Compaction (Soft/Hard 两阶段) + Eviction (消息卸载) + Emergency (紧急截断) + TokenCounter + ContextFileLoader | Summarization (LLM 摘要), ContextWindowGuard, Filtering 语义评分, 动态阈值 |
 | **Sandbox** | ★ Sandbox/SandboxManager 抽象 + DockerSandboxManager + NoopSandbox (测试) | gVisor, Firecracker, Remote, WASM |
 | **Dependencies** | ★ 完整启动流程 + 优雅关闭 | — |
 | **Config** | ★ 环境变量 + pydantic-settings | 配置中心热更新 |
 | **Worker 管理** | ★ GetStatus (资源监控) + ResourceMonitor | Drain (Phase 2), UpdateConfig (Phase 3) |
-| **Observability** | ★ structlog JSON + Prometheus 基础指标 | OpenTelemetry 追踪 |
+| **Observability** → [独立文档](./OBSERVABILITY-DESIGN.md) | ★ structlog JSON + Prometheus 8 层指标体系 | OpenTelemetry 分布式追踪, Grafana Dashboard, 全链路告警 |
+| **Hook 系统** | ★ HookRunner 核心 + 4 个内置 hook (`on_task_received`, `on_task_complete`, `before_tool_execute`, `after_tool_execute`) + 安全拦截 + 审计日志 | 扩展 Hook 配置加载, RAG 注入, PII 脱敏, Plugin API |
 
 ### Phase 1 开发顺序建议
 
@@ -6211,11 +8492,11 @@ Week 3-4 (与 Gateway 并行):
 Week 5-6:
   4. Agent Loop 接入真实 Anthropic SDK      ← 核心
   5. 工具系统 (exec + read + write)
-  6. Session Store (Redis)
+  6. Agent Memory — SessionStore (Redis + PG) + SessionLock
 
 Week 7-8:
   7. Sandbox 抽象 + DockerSandboxManager
-  8. Context Manager (Layer 1-2)
+  8. Context Manager (Filtering + Compaction + Eviction + Emergency + TokenCounter)
   9. 端到端集成测试 (LLM mock)
 ```
 
@@ -6253,9 +8534,16 @@ Week 7-8:
 | §4 Agent Loop (核心循环) | P1-7 LLM 交互循环 | Phase 1 |
 | §4 Agent Loop (人机交互) | P2-15 人机交互 | Phase 2 |
 | §5 EventEmitter | P1-8 事件发射 | Phase 1 |
-| §6 Model Router | P2-14 模型降级 | Phase 2 |
+| §6 Model Router (含 §6.8 Fallback) | P1-7 (Key 池 + 重试), P2-14 (模型降级链) | Phase 1 (第一/二层) / Phase 2 (第四层) |
 | §7 Tools | P1-13 基础工具 | Phase 1 |
-| §9 Session Store | P1-11 会话存储 | Phase 1 |
-| §10 Context Manager | — (内含在 Agent Loop 中) | Phase 1 |
-| §11 Sandbox | P1-12 + P1-15 | Phase 1 |
-| §12 Dependencies 启动流程 | P0-9 基础骨架 | Phase 0 |
+| §8 系统提示词构建 | P1-7 (含在 Agent Loop 中) | Phase 1 |
+| §9 沙箱管理 | P1-12 + P1-15 | Phase 1 |
+| §10 Skills 管理 | P2-16 技能体系 | Phase 1 (内置) / Phase 2 (扩展) |
+| §11 上下文管理 | — (含在 Agent Loop 中) | Phase 1 |
+| §12 Agent Memory | P1-11 SessionStore + SessionLock | Phase 1 (短期记忆) / Phase 2 (长期记忆) |
+| §14 Dependencies 启动流程 | P0-9 基础骨架 | Phase 0 |
+| §15 并发模型 | P0-9 (含在基础骨架中) | Phase 0 |
+| §16 错误处理与弹性 | P1-7 (含在 Agent Loop 中) | Phase 1 |
+| §17 配置管理 | P0-9 基础骨架 | Phase 0 |
+| §18 可观测性 → [独立文档](./OBSERVABILITY-DESIGN.md) | P1-14 日志 + 指标 | Phase 1 |
+| §13 Hook 系统 | — (Runtime 内部扩展点) | Phase 1 (核心) / Phase 2 (扩展加载) |

@@ -1,14 +1,16 @@
-# Event Bus 架构与对接协议
+# 异步事件传输协议（Runtime ↔ Gateway 对接规范）
 
-> Runtime → Event Bus → Gateway 的异步事件传输通道。
-> 定义 Redis Streams 数据模型、生产/消费协议、事件聚合、断线回放、Pipeline 处理器接口与演进路径。
+> **本文档不描述独立部署的服务**，而是定义 Runtime（事件生产者）和 Gateway（事件消费者）在 Redis Streams 上的数据模型、序列化格式、读写协议与交互约定。
+> 物理实现基于已有的 Redis 基础设施，不引入额外进程。
+>
+> 涵盖：Redis Streams 数据模型、生产/消费协议、事件聚合、断线回放、Pipeline 处理器接口与演进路径。
 >
 > 关联文档：
 > - [gRPC 协议设计](./GRPC-PROTOCOL-DESIGN.md) — 同步调度路径（路径 A）
-> - [Gateway 架构设计 §8](./GATEWAY-ARCHITECTURE-DESIGN.md) — Gateway Broadcaster 模块
-> - [Runtime 架构设计 §5](./RUNTIME-ARCHITECTURE-DESIGN.md) — Runtime EventEmitter 模块
+> - [Gateway 架构设计 §8](./GATEWAY-ARCHITECTURE-DESIGN.md) — Gateway Broadcaster 模块（消费侧实现）
+> - [Runtime 架构设计 §5](./RUNTIME-ARCHITECTURE-DESIGN.md) — Runtime EventEmitter 模块（生产侧实现）
 > - [WebSocket 协议设计 §9](./WS-PROTOCOL-DESIGN.md) — 断线恢复与事件回放
-> - [技术方案 §五](./TECH-PROPOSAL-C-END-REFACTOR.md) — Event Router 选型论证
+> - [技术方案 §五](../TECH-PROPOSAL-C-END-REFACTOR.md) — Event Router 选型论证
 
 ---
 
@@ -35,7 +37,12 @@
 
 ### 1.1 一句话定义
 
-Event Bus 是 Runtime 和 Gateway 之间的**异步事件传输通道**。Runtime 执行 Agent 任务时产生的每个 LLM delta、工具执行、生命周期事件，都通过 Event Bus 传递给 Gateway，再由 Gateway 推送给终端用户。
+本文档定义 Runtime 和 Gateway 之间**基于 Redis Streams 的异步事件传输协议**。Runtime 执行 Agent 任务时产生的每个 LLM delta、工具执行、生命周期事件，都通过 Redis Streams 传递给 Gateway，再由 Gateway 推送给终端用户。
+
+> **澄清**：文档中出现的 "Event Bus" 是对这套传输协议的简称，**不是一个独立部署的服务或进程**。物理上只涉及三个组件：
+> 1. **Runtime EventEmitter** — 调用 `XADD` 写入事件（生产侧，Python）
+> 2. **Redis Streams** — 已有基础设施，充当事件缓冲和持久化（中间层）
+> 3. **Gateway Consumer/Broadcaster** — 调用 `XREAD` 读取事件并推送给客户端（消费侧，Go）
 
 ### 1.2 为什么不用 gRPC Streaming
 
@@ -64,10 +71,14 @@ Event Bus 是 Runtime 和 Gateway 之间的**异步事件传输通道**。Runtim
 └──────────┘                                            └──────────┘
 
 路径 A: Gateway → gRPC SubmitTask → Runtime (提交/中止/查询)
-路径 B: Runtime → Redis Streams XADD → Gateway XREADGROUP → WS Push (事件流)
+路径 B: Runtime → Redis Streams XADD → Gateway XREAD → WS Push (事件流)
+
+注意: 路径 B 中没有独立的"Event Bus"进程。
+      Runtime 直接写 Redis，Gateway 直接读 Redis。
+      "Event Bus"只是这套读写协议的简称。
 ```
 
-### 2.2 Event Bus 不做什么
+### 2.2 本协议不覆盖什么
 
 | 不做 | 谁做 |
 | --- | --- |
@@ -76,7 +87,7 @@ Event Bus 是 Runtime 和 Gateway 之间的**异步事件传输通道**。Runtim
 | 客户端协议 | Gateway → WS |
 | 认证鉴权 | Gateway (JWT) |
 
-Event Bus **只做一件事**：把 Runtime 产出的事件可靠地送达 Gateway。
+本协议**只关注一件事**：把 Runtime 产出的事件通过 Redis Streams 可靠地送达 Gateway。
 
 ---
 
@@ -131,7 +142,7 @@ AgentEvent {
   run_id:       "run_01JK..."        执行 ID
   session_key:  "sess_abc123"        会话标识
   task_id:      "task_01JK..."       任务 ID
-  type:         EVENT_TYPE_DELTA     事件类型 (9 种)
+  type:         EVENT_TYPE_DELTA     事件类型 (12 种)
   timestamp_ms: 1706000001000        时间戳
   seq:          42                   session 内递增序列号
   trace_id:     "abc123..."          OpenTelemetry trace
@@ -146,6 +157,9 @@ AgentEvent {
     run_abort { reason, aborted_by }
     thinking { text }
     usage { model, input_tokens, output_tokens, iteration }
+    input_required { input_type, prompt, timeout_seconds }
+    tool_confirm_required { input_type, tool_call_id, tool_name, input_json, risk_description, timeout_seconds }
+    model_fallback { from_model, to_model, reason, fallback_layer }
   }
 }
 ```
@@ -357,6 +371,16 @@ XREAD 返回消息
   │   │
   │   ├── 事件类型 == RUN_COMPLETE / RUN_ERROR / RUN_ABORT?
   │   │   └── 触发 final 响应 (双响应模式的第二个 res 帧)
+  │   │       + 清除 Sticky Affinity (task→worker 映射)
+  │   │
+  │   ├── 事件类型 == INPUT_REQUIRED / TOOL_CONFIRM_REQUIRED?
+  │   │   └── ★ 特殊处理 (人机交互):
+  │   │       1. 记录 Sticky Affinity: task_id → worker_id
+  │   │       2. 推送给客户端 (展示输入框/确认弹窗)
+  │   │       3. 客户端响应后 → Gateway gRPC SendInput → Worker
+  │   │
+  │   ├── 事件类型 == MODEL_FALLBACK?
+  │   │   └── 推送给客户端 (可选: 展示模型切换通知)
   │   │
   │   └── 推送: conn.SendEvent(eventName, payload)
   │
@@ -644,7 +668,7 @@ func (p *Pipeline) Run(ctx context.Context, event *AgentEvent) *AgentEvent {
 | 数据类型 | 写入者 | 存储位置 | 保留策略 | 权威来源 |
 | --- | --- | --- | --- | --- |
 | **会话历史** (messages[]) | Runtime | Redis + PG | 永久 | Runtime |
-| **流式事件** (delta/tool) | Runtime → Bus | Redis Streams | MAXLEN ~5000 | Event Bus |
+| **流式事件** (delta/tool) | Runtime → Redis Streams | Redis Streams | MAXLEN ~5000 | Redis Streams |
 | **运行元数据** (token/耗时) | Runtime | PG | 永久 | Runtime |
 | **审计日志** | Gateway Pipeline | PG / 对象存储 | 3-5 年 | Pipeline |
 | **Resume Token** | Gateway | Redis | TTL 5min | Gateway |
@@ -952,6 +976,9 @@ type NATSConsumer struct { ... }         // Phase 3
 | `RUN_ERROR` | 偶发 | ~200B | 否 | 执行出错 ★ 触发 final |
 | `RUN_ABORT` | 偶发 | ~100B | 否 | 执行中止 ★ 触发 final |
 | `USAGE` | 每轮 1 次 | ~100B | 否 | Token 用量 |
+| `INPUT_REQUIRED` | 偶发 | ~200B | 否 | 需要用户文本输入 ★ 触发 Sticky Affinity |
+| `TOOL_CONFIRM_REQUIRED` | 偶发 | ~300B | 否 | 高危工具需用户确认 ★ 触发 Sticky Affinity |
+| `MODEL_FALLBACK` | 偶发 | ~150B | 否 | 模型降级通知 (Phase 2) |
 
 ### 附录 B. 与工程计划的任务映射
 
@@ -962,4 +989,5 @@ type NATSConsumer struct { ... }         // Phase 3
 | §6 事件聚合 | P1-10 150ms 限频聚合 | Phase 1 |
 | §7 断线回放 | P2-4 Gateway 多实例 | Phase 2 |
 | §8 Pipeline | P3-1 内容安全 + P3-2 脱敏 + P3-3 审计 | Phase 3 |
+| §5.4 人机交互事件处理 | P2-15 人机交互 | Phase 2 |
 | §10 路由优化 | P2-4 Gateway 多实例 | Phase 2 |

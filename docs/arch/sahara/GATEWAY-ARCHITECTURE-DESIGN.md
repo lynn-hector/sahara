@@ -7,7 +7,7 @@
 > - [gRPC 协议设计](./GRPC-PROTOCOL-DESIGN.md) — Gateway 作为 gRPC Client 调用 Runtime（D1）
 > - [WebSocket 协议设计](./WS-PROTOCOL-DESIGN.md) — Gateway 作为 WS Server 面向客户端（D2）
 > - [API Service 设计](./API-SERVICE-DESIGN.md) — C 端 RESTful API 服务（D7，用户/会话/文件等 HTTP 接口）
-> - [Event Bus 架构设计](./EVENT-BUS-DESIGN.md) — Gateway 消费事件的协议（D5）
+> - [异步事件传输协议](./EVENT-BUS-DESIGN.md) — Runtime ↔ Gateway 事件传输规范（D5）
 > - [技术方案 §三](./TECH-PROPOSAL-C-END-REFACTOR.md) — Gateway 七大职责与技术选型
 
 ---
@@ -4903,7 +4903,7 @@ func (r *Registry) onCheckFailed(w *WorkerEntry, err error) {
 
     if w.ConsecutiveFails >= r.config.DeadThreshold && w.State == WorkerStateReady {
         oldState := w.State
-        w.State = WorkerStateDead
+            w.State = WorkerStateDead
 
         slog.Error("worker marked DEAD",
             "workerId", w.ID, "addr", w.Addr,

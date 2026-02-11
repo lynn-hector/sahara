@@ -7,7 +7,7 @@
 > - [gRPC 协议设计](./GRPC-PROTOCOL-DESIGN.md) — Gateway ↔ Runtime 内部通信（D1）
 > - [Gateway 架构设计](./GATEWAY-ARCHITECTURE-DESIGN.md) — Go Gateway 实现蓝图（D3）
 > - [Runtime 架构设计](./RUNTIME-ARCHITECTURE-DESIGN.md) — Python Runtime 实现蓝图（D4）
-> - [Event Bus 架构设计](./EVENT-BUS-DESIGN.md) — 事件从 Runtime 传递到 Gateway 的异步路径（D5）
+> - [异步事件传输协议](./EVENT-BUS-DESIGN.md) — Runtime ↔ Gateway 事件传输规范（D5）
 
 ---
 
@@ -599,6 +599,7 @@ C 端仅暴露用户操作所需的最小方法集（~15 个），不暴露管�
 │  Agent 操作                                                    │
 │  ├── agent.submit          提交 Agent 任务         Phase 1     │
 │  ├── agent.abort           中止执行中的任务         Phase 1     │
+│  ├── agent.input           人机交互输入/确认        Phase 2     │
 │  └── agent.status          查询任务状态             Phase 2     │
 │                                                                │
 │  Session 操作                                                  │
@@ -739,7 +740,79 @@ C 端仅暴露用户操作所需的最小方法集（~15 个），不暴露管�
 }
 ```
 
-### 6.4 session.list — 列出会话
+### 6.4 agent.input — 人机交互输入
+
+当 Agent 执行过程中需要用户确认（如高危工具确认）或文本输入时，服务端会推送 `agent.input_required` 或 `agent.tool_confirm_required` 事件。客户端收到后展示相应 UI，用户操作后通过此方法提交响应。
+
+**请求**：
+
+```json
+{
+  "type": "req",
+  "id": "req_07...",
+  "method": "agent.input",
+  "params": {
+    "taskId": "task_01JK...",
+    "runId": "run_01JK...",
+    "action": "approve",
+    "input": ""
+  }
+}
+```
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `taskId` | string | 是 | 关联的任务 ID |
+| `runId` | string | 是 | 关联的执行 ID |
+| `action` | string | 是 | 用户动作：`"approve"` (确认) / `"reject"` (拒绝) / `"input"` (文本输入) |
+| `input` | string | 否 | 用户输入文本（`action="input"` 时必填；`action="reject"` 时可附带拒绝原因） |
+
+**响应**：
+
+```json
+{
+  "type": "res",
+  "id": "req_07...",
+  "code": 200,
+  "status": "ok",
+  "payload": {
+    "delivered": true
+  }
+}
+```
+
+**错误场景**：
+
+| code | reason | 说明 |
+| --- | --- | --- |
+| 404 | `TASK_NOT_FOUND` | 任务不存在或已结束 |
+| 409 | `TASK_NOT_WAITING` | 任务未在等待输入状态 |
+| 503 | `WORKER_UNAVAILABLE` | 持有任务的 Worker 不可用 |
+
+**人机交互完整流程**：
+
+```text
+Client                       Gateway                    Runtime Worker
+  │                              │                            │
+  │  (Agent 遇到高危工具)         │                            │
+  │                              │   ◀── Event Bus ──────────│ emit TOOL_CONFIRM_REQUIRED
+  │  ◀── event: agent.tool_confirm_required ──────────────── │
+  │  (展示确认弹窗)              │                            │
+  │                              │                            │
+  │  req: agent.input            │                            │
+  │  action="approve"            │                            │
+  │ ─────────────────────────── ▶│                            │
+  │                              │ gRPC SendInput (Sticky) ──▶│
+  │                              │                            │ Agent 恢复执行
+  │  ◀── res (ok, delivered) ────│                            │
+  │                              │                            │
+  │  ◀── event: agent.tool_start ────────────────────────────│ (继续执行工具)
+  │  ◀── event: agent.tool_result ───────────────────────────│
+```
+
+> **超时说明**：Agent 等待用户输入的默认超时为 **120 秒**。超时后 Agent 自动拒绝（工具确认场景）或跳过（文本输入场景），并推送 `agent.run_complete` 或继续执行。客户端在收到 `agent.input_required` / `agent.tool_confirm_required` 时应启动本地倒计时，超时后禁用输入 UI。
+
+### 6.5 session.list — 列出会话
 
 ```json
 {
@@ -779,7 +852,7 @@ C 端仅暴露用户操作所需的最小方法集（~15 个），不暴露管�
 }
 ```
 
-### 6.5 session.get — 获取会话详情
+### 6.6 session.get — 获取会话详情
 
 ```json
 {
@@ -829,7 +902,7 @@ C 端仅暴露用户操作所需的最小方法集（~15 个），不暴露管�
 }
 ```
 
-### 6.6 session.create — 创建会话
+### 6.7 session.create — 创建会话
 
 ```json
 {
@@ -857,7 +930,7 @@ C 端仅暴露用户操作所需的最小方法集（~15 个），不暴露管�
 }
 ```
 
-### 6.7 auth.refresh — 在连接上刷新 JWT
+### 6.8 auth.refresh — 在连接上刷新 JWT
 
 ```json
 {
@@ -884,7 +957,7 @@ C 端仅暴露用户操作所需的最小方法集（~15 个），不暴露管�
 }
 ```
 
-### 6.8 其他方法（Phase 2 或语义简单）
+### 6.9 其他方法（Phase 2 或语义简单）
 
 以下方法语义明确，遵循统一的 req/res 帧格式，在 Phase 2 或后续迭代中实现：
 
@@ -918,16 +991,19 @@ C 端仅暴露用户操作所需的最小方法集（~15 个），不暴露管�
 │  └── auth.expiring        JWT 即将过期（提前 60s 通知）        │
 │                                                                │
 │  Agent 事件 (来自 Event Bus)                                   │
-│  ├── agent.run_start      Agent 执行开始                       │
-│  ├── agent.delta          LLM 流式文本片段 (纯文本增量)        │
-│  ├── agent.content        非文本内容块 (图片/文件/代码/音频)   │
-│  ├── agent.thinking       模型思考内容                         │
-│  ├── agent.tool_start     工具开始执行                         │
-│  ├── agent.tool_result    工具执行结果                         │
-│  ├── agent.run_complete   Agent 执行完成 (含完整 Content 列表) │
-│  ├── agent.run_error      Agent 执行出错                       │
-│  ├── agent.run_abort      Agent 执行被中止                     │
-│  └── agent.usage          Token 用量统计                       │
+│  ├── agent.run_start              Agent 执行开始               │
+│  ├── agent.delta                  LLM 流式文本片段             │
+│  ├── agent.content                非文本内容块                 │
+│  ├── agent.thinking               模型思考内容                 │
+│  ├── agent.tool_start             工具开始执行                 │
+│  ├── agent.tool_result            工具执行结果                 │
+│  ├── agent.input_required         需要用户文本输入   Phase 2   │
+│  ├── agent.tool_confirm_required  高危工具需用户确认 Phase 2   │
+│  ├── agent.model_fallback         模型降级通知       Phase 2   │
+│  ├── agent.run_complete           Agent 执行完成               │
+│  ├── agent.run_error              Agent 执行出错               │
+│  ├── agent.run_abort              Agent 执行被中止             │
+│  └── agent.usage                  Token 用量统计               │
 │                                                                │
 │  系统                                                          │
 │  ├── tick                 心跳 (每 30s)                        │
@@ -952,8 +1028,8 @@ C 端仅暴露用户操作所需的最小方法集（~15 个），不暴露管�
     "resumeToken": "rt_01JKXYZ...",
     "resumed": false,
     "features": {
-      "methods": ["agent.submit", "agent.abort", "session.list", "..."],
-      "events": ["agent.delta", "agent.run_start", "..."]
+      "methods": ["agent.submit", "agent.abort", "agent.input", "session.list", "..."],
+      "events": ["agent.delta", "agent.run_start", "agent.input_required", "agent.tool_confirm_required", "..."]
     },
     "policy": {
       "maxFrameBytes": 1048576,
@@ -1125,6 +1201,83 @@ C 端仅暴露用户操作所需的最小方法集（~15 个），不暴露管�
 }
 ```
 
+#### agent.input_required — 需要用户文本输入
+
+Agent 在执行过程中需要用户提供额外信息时推送此事件。客户端应展示输入框。
+
+```json
+{
+  "event": "agent.input_required",
+  "payload": {
+    "inputType": "text_input",
+    "prompt": "请提供你希望使用的编程语言和版本",
+    "timeoutSeconds": 120
+  }
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `inputType` | 输入类型：`"text_input"` |
+| `prompt` | 提示文本，告诉用户需要输入什么 |
+| `timeoutSeconds` | 超时时间（秒），超时后 Agent 自动跳过 |
+
+> 客户端收到此事件后应展示输入框 UI，并启动本地倒计时。用户提交后通过 `agent.input` 方法发送响应。
+
+#### agent.tool_confirm_required — 高危工具需确认
+
+Agent 将要执行一个高危操作（如删除文件、执行系统命令）时推送此事件。客户端应展示确认弹窗。
+
+```json
+{
+  "event": "agent.tool_confirm_required",
+  "payload": {
+    "inputType": "tool_confirm",
+    "toolCallId": "call_01JK...",
+    "toolName": "exec",
+    "input": {
+      "command": "rm -rf /workspace/build"
+    },
+    "riskDescription": "将执行删除命令: rm -rf /workspace/build",
+    "timeoutSeconds": 120
+  }
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `inputType` | 输入类型：`"tool_confirm"` |
+| `toolCallId` | 工具调用 ID |
+| `toolName` | 工具名称 |
+| `input` | 工具输入参数（JSON 对象） |
+| `riskDescription` | 人类可读的风险描述 |
+| `timeoutSeconds` | 超时时间（秒），超时后 Agent 自动拒绝执行 |
+
+> 客户端应展示确认弹窗，显示工具名称、输入参数和风险描述。用户点击"确认"或"拒绝"后通过 `agent.input` 方法发送 `action: "approve"` 或 `action: "reject"`。
+
+#### agent.model_fallback — 模型降级通知 (Phase 2)
+
+当 LLM 调用因限流、不可用等原因触发模型降级时推送此事件。客户端可据此展示轻量提示（如 "已切换到备用模型"）。
+
+```json
+{
+  "event": "agent.model_fallback",
+  "payload": {
+    "fromModel": "claude-sonnet-4-20250514",
+    "toModel": "gpt-4o",
+    "reason": "rate_limit",
+    "fallbackLayer": 4
+  }
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `fromModel` | 原始模型 |
+| `toModel` | 降级目标模型 |
+| `reason` | 降级原因 |
+| `fallbackLayer` | 降级层级 (1=重试, 2=Key轮换, 3=上下文压缩, 4=模型降级链) |
+
 ### 7.4 tick — 心跳
 
 ```json
@@ -1188,6 +1341,8 @@ C 端仅暴露用户操作所需的最小方法集（~15 个），不暴露管�
 
 `agent.submit` 采用双响应（Dual Response）模式——一个请求返回两次响应：
 
+**基本流程**（无人机交互）：
+
 ```text
 Client                                         Gateway
   │                                                │
@@ -1210,6 +1365,46 @@ Client                                         Gateway
   │ ◀──────────────────────────────────────────────│ 任务结束
   │                                                │
 ```
+
+**含人机交互的流程**（Phase 2）：
+
+```text
+Client                                         Gateway
+  │                                                │
+  │  req: agent.submit                             │
+  │ ──────────────────────────────────────────────▶│
+  │  res (status="accepted")                       │
+  │ ◀──────────────────────────────────────────────│
+  │                                                │
+  │  event: agent.run_start                        │
+  │ ◀──────────────────────────────────────────────│
+  │  event: agent.delta ...                        │
+  │ ◀──────────────────────────────────────────────│
+  │                                                │
+  │  event: agent.tool_confirm_required            │  ← Agent 遇到高危工具
+  │ ◀──────────────────────────────────────────────│
+  │  (展示确认弹窗, 120s 倒计时)                    │
+  │                                                │
+  │  req: agent.input (action="approve")           │
+  │ ──────────────────────────────────────────────▶│  → gRPC SendInput → Worker
+  │  res (status="ok", delivered=true)             │
+  │ ◀──────────────────────────────────────────────│
+  │                                                │
+  │  event: agent.tool_start                       │  ← Agent 继续执行
+  │ ◀──────────────────────────────────────────────│
+  │  event: agent.tool_result                      │
+  │ ◀──────────────────────────────────────────────│
+  │  event: agent.delta ...                        │
+  │ ◀──────────────────────────────────────────────│
+  │  event: agent.run_complete                     │
+  │ ◀──────────────────────────────────────────────│
+  │                                                │
+  │  res (status="final")                          │
+  │ ◀──────────────────────────────────────────────│
+```
+
+> **注意**：`agent.input` 是独立的 RPC 方法（同步，单响应 `status: "ok"`），不参与双响应模式。
+> 双响应的 `accepted` / `final` 仍然只在 `agent.submit` 上产生。
 
 **客户端处理策略**：
 
@@ -1404,6 +1599,8 @@ Gateway 聚合: T+150ms "好的，我来"  → 一个 delta 事件推给客户�
 | `SYSTEM_BUSY` | 系统繁忙 | true | 所有 Worker 满载 |
 | `AGENT_TIMEOUT` | Agent 执行超时 | true | 任务执行超过上限 |
 | `SESSION_LOCKED` | Session 被占用 | true | 同一 session 已有任务在执行 |
+| `TASK_NOT_WAITING` | 任务未在等待输入 | false | `agent.input` 时任务非 WAITING 状态 |
+| `WORKER_UNAVAILABLE` | Worker 不可用 | true | 持有任务的 Worker 离线 (Sticky Affinity 失败) |
 | `IDEMPOTENCY_CONFLICT` | 幂等键冲突 | false | 相同 key 不同参数 |
 | `INTERNAL_ERROR` | 内部错误 | false | 服务端未预期的异常 |
 
@@ -1459,6 +1656,7 @@ Layer 2: tick 事件 (应用层)
 | 握手超时 | 5s | 连接建立后 5s 内未收到 welcome → 断开 |
 | 请求超时（默认） | 30s | 客户端发送 req 后 30s 无 res → 超时 |
 | agent.submit 超时 | 5min | 等待 final 响应的超时 |
+| agent.input 超时 | 5s | 投递用户输入到 Worker 的超时 |
 | idle 超时 | 10min | 10 分钟无任何 req → 服务端关闭连接（节省资源） |
 | auth 刷新宽限期 | 5min | JWT 过期后 5 分钟内未刷新 → 强制关闭 |
 
@@ -1718,8 +1916,10 @@ onReconnected(welcomeEvent):
 | 第三章 帧格式 | P1-2 WS 帧解析 | Phase 1 |
 | 第四章 连接生命周期 | P1-1 WS 连接管理 | Phase 1 |
 | 第五章 JWT 认证 | P2-1 JWT 无状态认证 | Phase 2 |
-| 第六章 RPC 方法 | P1-3 RPC 路由表 | Phase 1 |
-| 第七章 事件定义 | P1-9 Gateway 事件消费 | Phase 1 |
+| 第六章 RPC 方法 (基础) | P1-3 RPC 路由表 | Phase 1 |
+| 第六章 agent.input | P2-15 人机交互 | Phase 2 |
+| 第七章 事件定义 (基础) | P1-9 Gateway 事件消费 | Phase 1 |
+| 第七章 人机交互 + 降级事件 | P2-15 人机交互 + P2-14 模型降级 | Phase 2 |
 | 第八章 双响应模式 | P1-9 + P1-10 | Phase 1 |
 | 第九章 断线恢复 | P2-4 Gateway 多实例 | Phase 2 |
 | 第十章 多实例路由 | P2-4 Gateway 多实例 | Phase 2 |
@@ -1778,3 +1978,7 @@ onReconnected(welcomeEvent):
 | — | `welcome` 中 `resumeToken` | 新增：断线恢复支持 |
 | — | `event: "auth.expiring"` | 新增：JWT 过期提醒 |
 | — | `event: "agent.content"` | 新增：多模态内容块 |
+| — | `method: "agent.input"` | 新增：人机交互输入 |
+| — | `event: "agent.input_required"` | 新增：用户输入请求 |
+| — | `event: "agent.tool_confirm_required"` | 新增：工具确认请求 |
+| — | `event: "agent.model_fallback"` | 新增：模型降级通知 |

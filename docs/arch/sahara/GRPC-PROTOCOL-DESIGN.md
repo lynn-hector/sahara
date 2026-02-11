@@ -7,7 +7,9 @@
 > - [技术方案](./TECH-PROPOSAL-C-END-REFACTOR.md) — 第七章 gRPC vs MQ 选型论证
 > - [工程计划](./ENGINEERING-PLAN-C-END.md) — 第三章 Proto 初版定义
 > - [WebSocket 协议设计](./WS-PROTOCOL-DESIGN.md) — 客户端通信协议（D2）
-> - [Event Bus 架构设计](./EVENT-BUS-DESIGN.md) — 异步事件通信协议（D5）
+> - [异步事件传输协议](./EVENT-BUS-DESIGN.md) — Runtime ↔ Gateway 事件传输规范（D5）
+> - [Runtime 架构设计](./RUNTIME-ARCHITECTURE-DESIGN.md) — Runtime Worker 内部架构（D4）
+> - [Gateway 架构设计](./GATEWAY-ARCHITECTURE-DESIGN.md) — Gateway 内部架构（D7）
 
 ---
 
@@ -53,7 +55,7 @@ C 端用户
 
 | 方向 | 调用方 | 被调用方 | 用途 |
 | --- | --- | --- | --- |
-| Gateway → Runtime | Go gRPC Client | Python gRPC Server | 提交任务、中止任务、查询状态 |
+| Gateway → Runtime | Go gRPC Client | Python gRPC Server | 提交任务、中止任务、查询状态、人机交互输入 |
 | Gateway → Runtime | Go gRPC Client | Python gRPC Server | Worker 健康检查、负载查询、排空 |
 
 ### 1.3 不在范围内
@@ -62,7 +64,7 @@ C 端用户
 | --- | --- |
 | Client ↔ Gateway (WebSocket) | WS-PROTOCOL-DESIGN.md |
 | Client → Gateway (HTTP API) | HTTP-API-DESIGN.md |
-| Runtime → Event Bus → Gateway (事件流) | EVENT-BUS-DESIGN.md |
+| Runtime → Redis Streams → Gateway (事件流) | EVENT-BUS-DESIGN.md |
 | 服务 → Redis / PostgreSQL | 各模块架构设计文档 |
 
 ---
@@ -119,6 +121,7 @@ proto/
 │  AgentService (sahara.agent.v1)           核心业务                 │
 │  ├── SubmitTask       提交 Agent 任务          Phase 1             │
 │  ├── AbortTask        中止执行中的任务          Phase 1             │
+│  ├── SendInput        人机交互输入投递          Phase 2 (人机交互) │
 │  ├── GetTaskStatus    查询单个任务状态          Phase 1             │
 │  └── ListActiveTasks  列出所有活跃任务          Phase 2 (故障恢复) │
 │                                                                    │
@@ -160,6 +163,10 @@ service AgentService {
 
   // 中止正在执行的任务。幂等操作：任务已结束时返回 OK。
   rpc AbortTask(AbortTaskRequest) returns (AbortTaskResponse);
+
+  // 人机交互：将用户输入/确认投递给挂起中的 Agent 任务。
+  // 必须路由到持有该任务的 Worker（Sticky Affinity）。
+  rpc SendInput(SendInputRequest) returns (SendInputResponse);
 
   // 查询指定任务的当前状态。
   rpc GetTaskStatus(GetTaskStatusRequest) returns (GetTaskStatusResponse);
@@ -231,6 +238,9 @@ message TaskOptions {
 
   // 流式事件的目标 session (用于多设备同步)
   repeated string broadcast_session_keys = 4;
+
+  // 思考级别覆盖 ("none" / "brief" / "full", 为空则用 Agent 配置的默认值)
+  string thinking_level = 5;
 }
 
 message SubmitTaskResponse {
@@ -311,7 +321,85 @@ message AbortTaskResponse {
 3. 发射 `RUN_ABORT` 事件到 Event Bus，携带 `reason`
 4. 释放 session 锁
 
-### 5.4 GetTaskStatus — 查询任务状态
+### 5.4 SendInput — 人机交互输入
+
+**调用时机**：Agent 在执行过程中需要用户输入（如文本回答）或操作确认（如高危工具确认）时，Runtime 通过 Event Bus 发射 `INPUT_REQUIRED` / `TOOL_CONFIRM_REQUIRED` 事件。Gateway 收到该事件后推送到客户端，客户端响应后 Gateway 调用 `SendInput` 将用户输入投递回持有该任务的 Worker。
+
+```protobuf
+message SendInputRequest {
+  // 关联的任务 ID
+  string task_id = 1;
+
+  // 关联的执行 ID
+  string run_id = 2;
+
+  // 用户动作: "approve" (确认工具执行) / "reject" (拒绝) / "input" (文本输入)
+  string action = 3;
+
+  // 用户输入文本 (action="input" 时必填; action="reject" 时可附带拒绝原因)
+  string input = 4;
+}
+
+message SendInputResponse {
+  // 是否成功投递到 Agent 任务
+  bool delivered = 1;
+}
+```
+
+**关键行为**：
+
+| 场景 | gRPC 状态码 | 说明 |
+| --- | --- | --- |
+| 成功投递 | `OK` | delivered = true，Agent 恢复执行 |
+| 任务不存在或已结束 | `NOT_FOUND` | task_id / run_id 不匹配或任务已完成 |
+| 任务未在等待输入 | `FAILED_PRECONDITION` | 任务正在正常执行，不接受输入 |
+| 输入通道已满 | `RESOURCE_EXHAUSTED` | 极端情况，多个客户端同时发送 |
+
+**路由要求**：
+
+> **Sticky Affinity**：`SendInput` **必须**路由到持有该任务的 Worker。
+> Gateway 在收到 `INPUT_REQUIRED` / `TOOL_CONFIRM_REQUIRED` 事件时，记录 `(task_id, run_id) → worker_id` 映射，
+> 后续 `SendInput` 使用此映射直接路由，不走负载均衡（详见 §10.5）。
+
+**人机交互完整时序图**：
+
+```text
+Client              Gateway                  Runtime Worker              Event Bus
+  │                    │                          │                          │
+  │                    │  (任务执行中, Agent 遇到高危工具)                    │
+  │                    │                          │                          │
+  │                    │                          │ emit TOOL_CONFIRM_REQUIRED│
+  │                    │                          │ ────────────────────────▶│
+  │                    │     consume event         │                          │
+  │                    │ ◀─────────────────────────────────────────────────── │
+  │                    │                          │                          │
+  │                    │ MarkSticky(task→worker)   │                          │
+  │                    │ (记录亲和映射)             │                          │
+  │                    │                          │                          │
+  │  WS: tool_confirm │                          │                          │
+  │ ◀─────────────────│                          │                          │
+  │  (展示确认弹窗)    │                          │                          │
+  │                    │                          │                          │
+  │  WS: agent.input   │                          │                          │
+  │  action="approve"  │                          │                          │
+  │ ──────────────────▶│                          │                          │
+  │                    │                          │                          │
+  │                    │  gRPC SendInput (Sticky) │                          │
+  │                    │ ────────────────────────▶│                          │
+  │                    │                          │ input_channel.put()       │
+  │                    │                          │ (Agent 恢复执行)          │
+  │                    │  SendInputResponse       │                          │
+  │                    │ ◀────────────────────────│                          │
+  │                    │                          │                          │
+  │                    │                          │ (继续工具执行 → emit 后续事件)
+```
+
+**超时机制**：
+- Agent 等待输入的默认超时为 **120 秒**（由 Runtime 内部控制，不通过 gRPC 传递）
+- 超时后 Agent 自动拒绝（工具确认场景）或跳过（文本输入场景）
+- 超时不影响 gRPC 层面，属于 Runtime 内部 Agent Loop 逻辑
+
+### 5.5 GetTaskStatus — 查询任务状态
 
 ```protobuf
 message GetTaskStatusRequest {
@@ -334,10 +422,16 @@ message GetTaskStatusResponse {
 
   // 错误信息 (仅 state = FAILED 时有值)
   string error_message = 9;
+
+  // 是否正在等待用户输入 (state = WAITING_FOR_INPUT 时为 true)
+  bool waiting_for_input = 10;
+
+  // 当前实际使用的模型 (可能因 Fallback 降级而与 TaskOptions.model_override 不同)
+  string current_model = 11;
 }
 ```
 
-### 5.5 ListActiveTasks — 列出活跃任务
+### 5.6 ListActiveTasks — 列出活跃任务
 
 ```protobuf
 message ListActiveTasksRequest {
@@ -515,12 +609,13 @@ option go_package = "github.com/example/sahara/gen/sahara/common/v1;commonv1";
 // 任务状态 (全生命周期)
 enum TaskState {
   TASK_STATE_UNSPECIFIED = 0;
-  TASK_STATE_QUEUED = 1;           // 已接受，排队中
-  TASK_STATE_RUNNING = 2;          // 正在执行
-  TASK_STATE_COMPLETED = 3;        // 正常完成
-  TASK_STATE_FAILED = 4;           // 执行出错
-  TASK_STATE_ABORTED = 5;          // 被主动中止
-  TASK_STATE_TIMEOUT = 6;          // 超时
+  TASK_STATE_QUEUED = 1;                 // 已接受，排队中
+  TASK_STATE_RUNNING = 2;                // 正在执行
+  TASK_STATE_COMPLETED = 3;              // 正常完成
+  TASK_STATE_FAILED = 4;                 // 执行出错
+  TASK_STATE_ABORTED = 5;                // 被主动中止
+  TASK_STATE_TIMEOUT = 6;                // 超时
+  TASK_STATE_WAITING_FOR_INPUT = 7;      // 挂起，等待用户输入或确认
 }
 
 // 错误详情 (附加在 gRPC Status.details 中)
@@ -591,20 +686,26 @@ message AgentEvent {
     RunAbortPayload run_abort = 16;
     ThinkingPayload thinking = 17;
     UsagePayload usage = 18;
+    InputRequiredPayload input_required = 19;
+    ToolConfirmRequiredPayload tool_confirm_required = 20;
+    ModelFallbackPayload model_fallback = 21;
   }
 }
 
 enum EventType {
   EVENT_TYPE_UNSPECIFIED = 0;
-  EVENT_TYPE_DELTA = 1;            // LLM 流式文本片段
-  EVENT_TYPE_TOOL_START = 2;       // 工具开始执行
-  EVENT_TYPE_TOOL_RESULT = 3;      // 工具执行结果
-  EVENT_TYPE_RUN_START = 4;        // Agent 运行开始
-  EVENT_TYPE_RUN_COMPLETE = 5;     // Agent 运行完成
-  EVENT_TYPE_RUN_ERROR = 6;        // Agent 运行出错
-  EVENT_TYPE_RUN_ABORT = 7;        // Agent 运行被中止
-  EVENT_TYPE_THINKING = 8;         // 模型思考中
-  EVENT_TYPE_USAGE = 9;            // Token 用量统计
+  EVENT_TYPE_DELTA = 1;                    // LLM 流式文本片段
+  EVENT_TYPE_TOOL_START = 2;               // 工具开始执行
+  EVENT_TYPE_TOOL_RESULT = 3;              // 工具执行结果
+  EVENT_TYPE_RUN_START = 4;                // Agent 运行开始
+  EVENT_TYPE_RUN_COMPLETE = 5;             // Agent 运行完成
+  EVENT_TYPE_RUN_ERROR = 6;                // Agent 运行出错
+  EVENT_TYPE_RUN_ABORT = 7;                // Agent 运行被中止
+  EVENT_TYPE_THINKING = 8;                 // 模型思考中
+  EVENT_TYPE_USAGE = 9;                    // Token 用量统计
+  EVENT_TYPE_INPUT_REQUIRED = 10;          // Agent 需要用户文本输入
+  EVENT_TYPE_TOOL_CONFIRM_REQUIRED = 11;   // 高危工具需要用户确认
+  EVENT_TYPE_MODEL_FALLBACK = 12;          // 模型降级通知 (Phase 2)
 }
 
 // --- 各事件的 Payload 定义 ---
@@ -672,6 +773,45 @@ message UsagePayload {
   int32 cache_write_tokens = 5;
   // 本轮迭代编号
   int32 iteration = 6;
+}
+
+// --- 人机交互事件 Payload ---
+
+message InputRequiredPayload {
+  // 输入类型: "text_input"
+  string input_type = 1;
+  // 提示文本 (告诉用户需要输入什么)
+  string prompt = 2;
+  // 超时时间 (秒, 默认 120)
+  int32 timeout_seconds = 3;
+}
+
+message ToolConfirmRequiredPayload {
+  // 输入类型: "tool_confirm"
+  string input_type = 1;
+  // 需要确认的工具调用 ID
+  string tool_call_id = 2;
+  // 工具名称
+  string tool_name = 3;
+  // 工具输入参数 (JSON)
+  string input_json = 4;
+  // 风险描述 (人类可读, 如 "将执行 rm -rf /workspace/build")
+  string risk_description = 5;
+  // 超时时间 (秒, 默认 120)
+  int32 timeout_seconds = 6;
+}
+
+// --- 模型降级事件 Payload (Phase 2) ---
+
+message ModelFallbackPayload {
+  // 原始模型
+  string from_model = 1;
+  // 降级目标模型
+  string to_model = 2;
+  // 降级原因
+  string reason = 3;
+  // 降级层级 (1=重试, 2=Key轮换, 3=上下文压缩, 4=模型降级链)
+  int32 fallback_layer = 4;
 }
 ```
 
@@ -750,6 +890,8 @@ if err != nil {
 | `MODEL_UNAVAILABLE` | UNAVAILABLE | 指定的 LLM 模型不可用 |
 | `IDEMPOTENCY_CONFLICT` | ABORTED | 相同幂等键但参数不同 |
 | `SANDBOX_UNAVAILABLE` | INTERNAL | 沙箱池耗尽 |
+| `TASK_NOT_WAITING` | FAILED_PRECONDITION | 任务未在等待输入状态 (SendInput) |
+| `INPUT_CHANNEL_FULL` | RESOURCE_EXHAUSTED | 输入通道已满 (SendInput) |
 
 ---
 
@@ -959,6 +1101,68 @@ func (d *Dispatcher) pickForSession(sessionKey string) *Worker {
 }
 ```
 
+### 10.5 Sticky Affinity — 任务级强制亲和（人机交互）
+
+与 Session 亲和性（软亲和、可降级）不同，`SendInput` 要求**任务级强制亲和**——必须路由到持有该任务的 Worker，否则会收到 `NOT_FOUND`。
+
+**触发条件**：Gateway 从 Event Bus 消费到 `INPUT_REQUIRED` 或 `TOOL_CONFIRM_REQUIRED` 事件时，记录强亲和映射。
+
+**清除条件**：收到该任务的终态事件（`RUN_COMPLETE` / `RUN_ERROR` / `RUN_ABORT`）时清除映射。
+
+```go
+// Gateway 任务级强亲和管理
+type StickyAffinity struct {
+    mu     sync.RWMutex
+    sticky map[string]string  // task_id → worker_id
+}
+
+func (s *StickyAffinity) MarkSticky(taskID, workerID string) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    s.sticky[taskID] = workerID
+}
+
+func (s *StickyAffinity) ClearSticky(taskID string) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    delete(s.sticky, taskID)
+}
+
+func (s *StickyAffinity) GetWorker(taskID string) (string, bool) {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    wid, ok := s.sticky[taskID]
+    return wid, ok
+}
+```
+
+```go
+// Gateway Dispatcher.SendInput 路由
+func (d *Dispatcher) SendInput(ctx context.Context, req *agentv1.SendInputRequest) (*agentv1.SendInputResponse, error) {
+    // 1. 查找强亲和映射
+    workerID, ok := d.stickyAffinity.GetWorker(req.TaskId)
+    if !ok {
+        return nil, status.Errorf(codes.NotFound, "no sticky worker for task %s", req.TaskId)
+    }
+
+    // 2. 直接路由到目标 Worker (不走轮询/负载均衡)
+    worker := d.registry.GetWorker(workerID)
+    if worker == nil || worker.State != READY {
+        return nil, status.Errorf(codes.Unavailable, "sticky worker %s not available", workerID)
+    }
+
+    return worker.Client.SendInput(ctx, req)
+}
+```
+
+**三层亲和策略对比**：
+
+| 层级 | 适用场景 | 绑定强度 | 降级行为 |
+| --- | --- | --- | --- |
+| **无亲和** | SubmitTask (Phase 1) | 无 | Round Robin |
+| **Session 亲和** (§10.4) | SubmitTask (Phase 2) | 软 — Worker 满载/不可用时降级 | 回退到 Least Active |
+| **Sticky 亲和** (§10.5) | SendInput | 强 — 必须命中目标 Worker | 不降级，返回错误 |
+
 ---
 
 ## 十一、超时与重试策略
@@ -969,6 +1173,7 @@ func (d *Dispatcher) pickForSession(sessionKey string) *Worker {
 | --- | --- | --- |
 | `SubmitTask` | **5s** | 只等待"接受/拒绝"判定，不等任务执行完 |
 | `AbortTask` | **10s** | 等待取消信号发送和确认 |
+| `SendInput` | **5s** | 投递用户输入到 Agent 的 input_channel，不等任务恢复执行 |
 | `GetTaskStatus` | **3s** | 简单查询 |
 | `ListActiveTasks` | **5s** | 可能任务较多 |
 | `GetStatus` | **3s** | 轻量级健康查询 |
@@ -999,8 +1204,13 @@ async def SubmitTask(self, request, context):
 | `UNAVAILABLE` | 是 | 下一个 Worker | 遍历所有 Worker |
 | `DEADLINE_EXCEEDED` | 否 | — | — |
 | `INVALID_ARGUMENT` | 否 | — | — |
+| `NOT_FOUND` | 否 | — | — |
+| `FAILED_PRECONDITION` | 否 | — | — |
 | `INTERNAL` | 否 | — | — |
 | 网络错误 (连接断开) | 是 | 同一 Worker (1次)，然后下一个 | 2 |
+
+> **SendInput 重试注意**：`SendInput` 使用 Sticky Affinity 路由（§10.5），不走 Worker 轮转。
+> `NOT_FOUND` 表示任务已结束或不存在，`FAILED_PRECONDITION` 表示任务未在等待状态，均不应重试。
 
 **gRPC Service Config 重试**（仅对幂等 RPC 启用）：
 
@@ -1261,6 +1471,21 @@ grpcurl -plaintext -d '{
   "run_id": "run-abc",
   "reason": "user cancelled"
 }' localhost:50051 sahara.agent.v1.AgentService/AbortTask
+
+# 人机交互：确认工具执行
+grpcurl -plaintext -d '{
+  "task_id": "task-001",
+  "run_id": "run-abc",
+  "action": "approve"
+}' localhost:50051 sahara.agent.v1.AgentService/SendInput
+
+# 人机交互：文本输入
+grpcurl -plaintext -d '{
+  "task_id": "task-001",
+  "run_id": "run-abc",
+  "action": "input",
+  "input": "使用 Python 3.12"
+}' localhost:50051 sahara.agent.v1.AgentService/SendInput
 ```
 
 ### 16.2 生产阶段
@@ -1349,10 +1574,15 @@ plugins:
 | 第五章 AgentService Proto | P0-4 编写核心 Proto 定义 | Phase 0 |
 | 第五章 SubmitTask 实现 | P1-4 (Go) + P1-6 (Python) | Phase 1 |
 | 第五章 AbortTask 实现 | P1-4 (Go) + P1-6 (Python) | Phase 1 |
+| 第五章 SendInput 实现 | P2-15 人机交互 | Phase 2 |
+| 第五章 GetTaskStatus 实现 | P1-4 (Go) + P1-6 (Python) | Phase 1 |
 | 第六章 GetStatus 实现 | P0-10 健康检查联通 | Phase 0 |
 | 第六章 Drain 实现 | P2-6 Worker 优雅关闭 | Phase 2 |
+| 第七章 INPUT_REQUIRED / TOOL_CONFIRM 事件 | P2-15 人机交互 | Phase 2 |
+| 第七章 MODEL_FALLBACK 事件 | P2-14 模型降级链 | Phase 2 |
 | 第九章 连接管理 | P1-4 gRPC client pool | Phase 1 |
-| 第十章 负载均衡 | P2-5 负载感知调度 | Phase 2 |
+| 第十章 负载均衡 (轮询 + 降级) | P1-4 基础调度 | Phase 1 |
+| 第十章 负载均衡 (Sticky Affinity) | P2-15 人机交互 | Phase 2 |
 | 第十二章 Metadata | P1-4 + P1-6 | Phase 1 |
 | 第十三章 mTLS | P2-12 K8s 部署 | Phase 2 |
 | 第十六章 Server Reflection | P0-10 gRPC 通信验证 | Phase 0 |
