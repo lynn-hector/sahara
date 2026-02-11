@@ -1,0 +1,142 @@
+# ===========================
+# OS & Editor
+# ===========================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# ===========================
+# Go
+# ===========================
+# 编译产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# 测试
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# vendor 目录 (如果不提交依赖)
+# vendor/
+
+# Air 热重载
+tmp/
+
+# ===========================
+# Python
+# ===========================
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env/
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+wheels/
+*.whl
+sdist/
+develop-eggs/
+.installed.cfg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+nosetests.xml
+coverage.xml
+*.cover
+
+# mypy / pyright / ruff
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ===========================
+# gRPC / Protobuf
+# ===========================
+# 生成的代码 (按需取消注释)
+# *_pb2.py
+# *_pb2_grpc.py
+# *.pb.go
+
+# ===========================
+# Docker
+# ===========================
+docker-compose.override.yml
+
+# ===========================
+# 环境与密钥
+# ===========================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+credentials.json
+secrets.yaml
+secrets.yml
+
+# ===========================
+# 日志与数据
+# ===========================
+*.log
+logs/
+data/
+*.db
+*.sqlite3
+
+# ===========================
+# 其他
+# ===========================
+node_modules/
+.terraform/
+*.tfstate
+*.tfstate.backup
