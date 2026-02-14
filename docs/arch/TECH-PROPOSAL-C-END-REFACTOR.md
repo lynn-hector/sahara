@@ -894,6 +894,7 @@ Phase 4: 大规模 (6+ 月)
 | [SANDBOX-DESIGN.md](./sahara/SANDBOX-DESIGN.md) | D6: Sandbox 管理与演进 |
 | [API-SERVICE-DESIGN.md](./sahara/API-SERVICE-DESIGN.md) | D7: API Service 设计 (C 端 RESTful HTTP) |
 | [OBSERVABILITY-DESIGN.md](./sahara/OBSERVABILITY-DESIGN.md) | D8: 可观测性设计 (Metrics/Logs/Traces) |
+| [PLUGIN-SYSTEM-DESIGN.md](./sahara/PLUGIN-SYSTEM-DESIGN.md) | D9: Plugin 系统设计 (Phase 3 规划) |
 
 **OpenClaw 参考文档（现有架构）**：
 

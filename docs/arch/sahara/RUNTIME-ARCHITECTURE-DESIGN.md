@@ -10,6 +10,7 @@
 > - [上下文管理架构](./CONTEXT-MANAGEMENT-DESIGN.md) — 知识比特率优化、四种策略 (卸载/压实/摘要/过滤) 详细设计（D7）
 > - [Agent Memory 架构](./AGENT-MEMORY-DESIGN.md) — 三层记忆体系 (工作/短期/长期)、Session Store、Knowledge Store（D8）
 > - [可观测性架构](./OBSERVABILITY-DESIGN.md) — Metrics/Logs/Traces 三支柱，全局视角设计（D9）
+> - [Plugin 系统设计](./PLUGIN-SYSTEM-DESIGN.md) — Plugin 生命周期、Registry、安全与隔离（D10，Phase 3 规划）
 > - [技术方案 §四](./TECH-PROPOSAL-C-END-REFACTOR.md) — Runtime 八大子系统与选型
 > - [OpenClaw AGENT-RUNTIME-v2.md](./openclaw/agent/AGENT-RUNTIME-v2.md) — 原始架构参考
 
@@ -93,6 +94,7 @@
 18. [可观测性](#十八可观测性)
 19. [安全架构总览](#十九安全架构总览)
 20. [Phase 1 最小实现范围](#二十phase-1-最小实现范围)
+21. [Plugin 系统 → 独立文档](./PLUGIN-SYSTEM-DESIGN.md)
 
 ---
 
@@ -8480,6 +8482,7 @@ class RuntimeConfig(BaseSettings):
 | **Worker 管理** | ★ GetStatus (资源监控) + ResourceMonitor | Drain (Phase 2), UpdateConfig (Phase 3) |
 | **Observability** → [独立文档](./OBSERVABILITY-DESIGN.md) | ★ structlog JSON + Prometheus 8 层指标体系 | OpenTelemetry 分布式追踪, Grafana Dashboard, 全链路告警 |
 | **Hook 系统** | ★ HookRunner 核心 + 4 个内置 hook (`on_task_received`, `on_task_complete`, `before_tool_execute`, `after_tool_execute`) + 安全拦截 + 审计日志 | 扩展 Hook 配置加载, RAG 注入, PII 脱敏, Plugin API |
+| **Plugin 系统** → [独立文档](./PLUGIN-SYSTEM-DESIGN.md) | ★ 预留接口: Tool/Skill/Hook 的 `source` 字段 + ToolRegistry/SkillLoader 的 `plugin_*` 参数 + Dependencies 的 `plugin_registry` 字段 | 完整 Plugin 生命周期 (Phase 3) |
 
 ### Phase 1 开发顺序建议
 
@@ -8499,6 +8502,23 @@ Week 7-8:
   8. Context Manager (Filtering + Compaction + Eviction + Emergency + TokenCounter)
   9. 端到端集成测试 (LLM mock)
 ```
+
+---
+
+## 二十一、Plugin 系统 → [独立文档](./PLUGIN-SYSTEM-DESIGN.md)
+
+> Plugin 系统是跨 Tools / Skills / Hooks 的横切关注点，已独立为 [PLUGIN-SYSTEM-DESIGN.md](./PLUGIN-SYSTEM-DESIGN.md)。
+> Phase 3 实现，Phase 1-2 仅需在各子系统中预留扩展接口。
+
+**Phase 1-2 需预留的接口摘要**（详见独立文档 §10）：
+
+| 子系统 | 预留项 | Phase 1-2 行为 |
+| --- | --- | --- |
+| **Tool** (§7) | `Tool.source` 字段 + `ToolRegistry.create_tools(plugin_tools=)` 参数 | `source="builtin"`, `plugin_tools=None` |
+| **Skill** (§10) | `SkillEntry.source` 字段 + `SkillLoader` 接受 `plugin_skills` 参数 | `source="bundled"/"configured"`, `plugin_skills=None` |
+| **Hook** (§13) | `HookRegistration.source` 字段 + `HookRunner.register(source="plugin:*")` | `source="internal"`, 不调用 plugin 注册 |
+| **Dependencies** (§14) | `plugin_registry: PluginRegistry \| None` 字段 | `None` |
+| **Config** (§17) | `RuntimeConfig.plugins` 配置块 | 空 / 不解析 |
 
 ---
 

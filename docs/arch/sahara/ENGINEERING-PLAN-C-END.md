@@ -514,6 +514,8 @@ class AgentServicer(AgentServiceServicer):
 | P3-11 | 多租户支持 | 租户隔离 (数据/配额/模型配置)；租户级计费 | 5d |
 | P3-12 | Agent Memory Long-term | 向量存储 (pgvector/pg_trgm)；MemoryIndexer + MemorySearch；自动回忆注入 System Prompt | 5d |
 | P3-13 | Gateway Pipeline 处理器 | 内容安全检查 + PII 脱敏 + 审计日志；可配置 Processor 链 | 3d |
+| P3-14 | Plugin 系统 | PluginManifest + PluginAPI + PluginRegistry + PluginLoader + SlotManager + AccessControl；参见 [PLUGIN-SYSTEM-DESIGN.md](./PLUGIN-SYSTEM-DESIGN.md) | 12d |
+| P3-15 | Plugin 管理后台 | API Service 侧：Plugin 安装/配置/启停 UI；Plugin 审核流程 | 5d |
 
 ---
 
@@ -1082,6 +1084,7 @@ DevOps: [CI + Compose]  [Redis/PG 配置]  [监控基础]       [集成测试环
 | [SANDBOX-DESIGN.md](./SANDBOX-DESIGN.md) | Sandbox 管理与演进 | D6 |
 | [API-SERVICE-DESIGN.md](./API-SERVICE-DESIGN.md) | API Service 设计 (C 端 RESTful HTTP) | D7 |
 | [OBSERVABILITY-DESIGN.md](./OBSERVABILITY-DESIGN.md) | 可观测性设计 (Metrics/Logs/Traces) | D8 |
+| [PLUGIN-SYSTEM-DESIGN.md](./PLUGIN-SYSTEM-DESIGN.md) | Plugin 系统设计 (Phase 3 规划) | D9 |
 
 **OpenClaw 参考文档（现有架构）**：
 
