@@ -70,18 +70,30 @@ class WorkerServicer(worker_pb2_grpc.WorkerServiceServicer):
         self._state = worker_pb2.WORKER_STATE_DRAINING
         self._draining = True
 
-        remaining = self._agent_servicer.active_count
         timeout_s = request.timeout_seconds or 60
-        estimated_complete_ms = int((time.time() + timeout_s) * 1000)
 
+        # Enter drain mode — rejects new SubmitTask calls
+        self._agent_servicer.start_drain()
+
+        remaining_before = self._agent_servicer.active_count
         logger.info(
             "worker_draining",
-            remaining_tasks=remaining,
+            remaining_tasks=remaining_before,
             timeout_seconds=timeout_s,
         )
 
+        # Wait for running tasks to complete (non-blocking for the gRPC response)
+        remaining_after = await self._agent_servicer.wait_drain(timeout=timeout_s)
+        estimated_complete_ms = int(time.time() * 1000)
+
+        if remaining_after == 0:
+            self._state = worker_pb2.WORKER_STATE_OFFLINE
+            logger.info("worker_drained_clean")
+        else:
+            logger.warning("worker_drain_timeout", remaining=remaining_after)
+
         return worker_pb2.DrainResponse(
-            remaining_tasks=remaining,
+            remaining_tasks=remaining_after,
             estimated_complete_at_ms=estimated_complete_ms,
         )
 

@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/sahara-ai/sahara/gateway/internal/auth"
+	"github.com/sahara-ai/sahara/gateway/internal/metrics"
 	"github.com/sahara-ai/sahara/pkg/errcode"
 )
 
@@ -40,10 +42,10 @@ type Hub struct {
 	conns  map[string]*Conn
 	sessID map[string]map[string]bool // sessionKey → set of connIDs
 
-	router   *Router
-	limiter  *RateLimiter
-	upgrader websocket.Upgrader
-	apiKey   string
+	router        *Router
+	limiter       *RateLimiter
+	upgrader      websocket.Upgrader
+	authenticator *auth.Authenticator
 
 	register   chan *Conn
 	unregister chan *Conn
@@ -55,6 +57,7 @@ type Conn struct {
 	ID         string
 	SessionKey string
 	UserID     string
+	Claims     *auth.Claims // JWT claims (nil in API-key/open mode)
 
 	hub  *Hub
 	ws   *websocket.Conn
@@ -63,8 +66,8 @@ type Conn struct {
 
 // NewHub creates a connection manager with the given RPC router.
 // allowedOrigins: comma-separated list of allowed origins, or "*" for all.
-// apiKey: if non-empty, clients must provide this key via Authorization header or query param.
-func NewHub(router *Router, allowedOrigins string, apiKey string) *Hub {
+// authenticator: handles JWT / API key / open auth on WS upgrade.
+func NewHub(router *Router, allowedOrigins string, authenticator *auth.Authenticator) *Hub {
 	originSet := buildOriginSet(allowedOrigins)
 	return &Hub{
 		conns:  make(map[string]*Conn),
@@ -75,11 +78,11 @@ func NewHub(router *Router, allowedOrigins string, apiKey string) *Hub {
 			WriteBufferSize: 4096,
 			CheckOrigin:     makeOriginChecker(originSet),
 		},
-		apiKey:     apiKey,
-		limiter:    NewRateLimiter(10),
-		register:   make(chan *Conn, 256),
-		unregister: make(chan *Conn, 256),
-		done:       make(chan struct{}),
+		authenticator: authenticator,
+		limiter:       NewRateLimiter(10),
+		register:      make(chan *Conn, 256),
+		unregister:    make(chan *Conn, 256),
+		done:          make(chan struct{}),
 	}
 }
 
@@ -125,6 +128,7 @@ func (h *Hub) Run() {
 				h.sessID[conn.SessionKey][conn.ID] = true
 			}
 			h.mu.Unlock()
+			metrics.WSConnsActive.Inc()
 			slog.Info("ws conn registered", "conn_id", conn.ID, "session_key", conn.SessionKey)
 
 		case conn := <-h.unregister:
@@ -140,6 +144,7 @@ func (h *Hub) Run() {
 				close(conn.send)
 			}
 			h.mu.Unlock()
+			metrics.WSConnsActive.Dec()
 			h.limiter.Remove(conn.ID)
 			slog.Info("ws conn unregistered", "conn_id", conn.ID)
 
@@ -203,18 +208,17 @@ func (h *Hub) BindSession(connID, sessionKey string) {
 
 // ServeWS upgrades an HTTP request to WebSocket and starts read/write pumps.
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
-	// API Key 认证
-	if h.apiKey != "" {
-		token := extractToken(r)
-		if token != h.apiKey {
-			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-			return
-		}
+	// Authenticate (JWT / API Key / open)
+	claims, err := h.authenticator.AuthenticateWS(r)
+	if err != nil {
+		slog.Warn("ws auth rejected", "err", err, "remote", r.RemoteAddr)
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
 	}
 
-	wsConn, err := h.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		slog.Error("ws upgrade failed", "err", err)
+	wsConn, upgradeErr := h.upgrader.Upgrade(w, r, nil)
+	if upgradeErr != nil {
+		slog.Error("ws upgrade failed", "err", upgradeErr)
 		return
 	}
 
@@ -223,28 +227,24 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		connID = generateConnID()
 	}
 
+	userID := ""
+	if claims != nil {
+		userID = claims.UserID
+	}
+
 	conn := &Conn{
-		ID:   connID,
-		hub:  h,
-		ws:   wsConn,
-		send: make(chan []byte, 256),
+		ID:     connID,
+		UserID: userID,
+		Claims: claims,
+		hub:    h,
+		ws:     wsConn,
+		send:   make(chan []byte, 256),
 	}
 
 	h.register <- conn
 
 	go conn.writePump()
 	go conn.readPump()
-}
-
-// extractToken reads the API key from Authorization header or "token" query param.
-func extractToken(r *http.Request) string {
-	if auth := r.Header.Get("Authorization"); auth != "" {
-		if strings.HasPrefix(auth, "Bearer ") {
-			return strings.TrimPrefix(auth, "Bearer ")
-		}
-		return auth
-	}
-	return r.URL.Query().Get("token")
 }
 
 // readPump reads messages from the WebSocket and dispatches them.
@@ -281,8 +281,16 @@ func (c *Conn) readPump() {
 			continue
 		}
 
-		if !c.hub.limiter.Allow(c.ID) {
-			errRes := ErrorFrame(frame.ID, errcode.GWRateLimit, "too many requests")
+		rejected := c.hub.limiter.AllowMulti(c.ID, c.UserID)
+		if rejected != Allowed {
+			msg := "too many requests"
+			switch rejected {
+			case RejectedUser:
+				msg = "user rate limit exceeded"
+			case RejectedGlobal:
+				msg = "server is busy, please slow down"
+			}
+			errRes := ErrorFrame(frame.ID, errcode.GWRateLimit, msg)
 			data, _ := json.Marshal(errRes)
 			select {
 			case c.send <- data:

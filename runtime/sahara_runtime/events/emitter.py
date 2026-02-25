@@ -13,6 +13,22 @@ from sahara_runtime.events.backend import EventBackend
 logger = structlog.get_logger(__name__)
 
 
+def _inc_event_metric(event_type: int) -> None:
+    try:
+        from sahara_runtime.observability.metrics import EVENTS_EMITTED
+        EVENTS_EMITTED.labels(event_type=str(event_type)).inc()
+    except Exception:
+        pass
+
+
+def _inc_event_error_metric() -> None:
+    try:
+        from sahara_runtime.observability.metrics import EVENT_PUBLISH_ERRORS
+        EVENT_PUBLISH_ERRORS.inc()
+    except Exception:
+        pass
+
+
 class EventEmitterFactory:
     """工厂: 根据 run 创建 RunEmitter 实例。"""
 
@@ -68,7 +84,9 @@ class RunEmitter:
         data = event.SerializeToString()
         try:
             await self._backend.publish(self._topic, data)
+            _inc_event_metric(event_type)
         except Exception:
+            _inc_event_error_metric()
             logger.exception("event_publish_failed", event_type=event_type, seq=self._seq)
 
     # ── 便捷方法 ──────────────────────────────────────
@@ -152,6 +170,41 @@ class RunEmitter:
             run_abort=event_pb2.RunAbortPayload(
                 reason=reason,
                 aborted_by=aborted_by,
+            ),
+        )
+
+    async def emit_input_required(
+        self,
+        prompt: str,
+        input_type: str = "text_input",
+        timeout_seconds: int = 120,
+    ) -> None:
+        await self._emit(
+            event_pb2.EVENT_TYPE_INPUT_REQUIRED,
+            input_required=event_pb2.InputRequiredPayload(
+                input_type=input_type,
+                prompt=prompt,
+                timeout_seconds=timeout_seconds,
+            ),
+        )
+
+    async def emit_tool_confirm_required(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        input_json: str,
+        risk_description: str = "",
+        timeout_seconds: int = 120,
+    ) -> None:
+        await self._emit(
+            event_pb2.EVENT_TYPE_TOOL_CONFIRM_REQUIRED,
+            tool_confirm_required=event_pb2.ToolConfirmRequiredPayload(
+                input_type="tool_confirm",
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                input_json=input_json,
+                risk_description=risk_description,
+                timeout_seconds=timeout_seconds,
             ),
         )
 

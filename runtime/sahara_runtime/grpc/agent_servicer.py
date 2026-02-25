@@ -25,6 +25,15 @@ logger = structlog.get_logger(__name__)
 
 
 @dataclass
+class UserInput:
+    """用户通过 SendInput RPC 投递的输入。"""
+
+    action: str  # "approve" / "reject" / "input"
+    text: str = ""
+    task_id: str = ""
+
+
+@dataclass
 class TaskHandle:
     """Runtime 内存中的活跃任务句柄。"""
 
@@ -39,6 +48,10 @@ class TaskHandle:
     total_tokens: int = 0
     error_message: str = ""
 
+    # 人机交互 (P2-15)
+    input_channel: asyncio.Queue | None = None
+    waiting_for_input: bool = False
+
 
 class AgentServicer(agent_pb2_grpc.AgentServiceServicer):
     """实现 AgentService RPC。"""
@@ -47,6 +60,8 @@ class AgentServicer(agent_pb2_grpc.AgentServiceServicer):
         self._container = container
         self._max_tasks = container.settings.max_concurrent_tasks
         self._tasks: dict[str, TaskHandle] = {}
+        self._draining = False
+        self._drain_event: asyncio.Event | None = None
 
     @property
     def active_count(self) -> int:
@@ -56,11 +71,35 @@ class AgentServicer(agent_pb2_grpc.AgentServiceServicer):
     def available_slots(self) -> int:
         return max(0, self._max_tasks - len(self._tasks))
 
+    @property
+    def is_draining(self) -> bool:
+        return self._draining
+
+    def start_drain(self) -> None:
+        """Enter drain mode — reject new tasks, signal when all complete."""
+        self._draining = True
+        self._drain_event = asyncio.Event()
+        if not self._tasks:
+            self._drain_event.set()
+
+    async def wait_drain(self, timeout: float = 60) -> int:
+        """Wait for all tasks to complete (up to timeout). Returns remaining count."""
+        if self._drain_event is None:
+            return 0
+        try:
+            await asyncio.wait_for(self._drain_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        return len(self._tasks)
+
     async def SubmitTask(
         self,
         request: agent_pb2.SubmitTaskRequest,
         context: grpc.aio.ServicerContext,
     ) -> agent_pb2.SubmitTaskResponse:
+        if self._draining:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, "worker is draining")
+
         if self.available_slots <= 0:
             await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "worker is busy")
 
@@ -82,6 +121,16 @@ class AgentServicer(agent_pb2_grpc.AgentServiceServicer):
             agent_id=request.agent_id,
         )
 
+        handle = TaskHandle(
+            task=None,  # set below after task creation
+            task_id=task_id,
+            run_id=run_id,
+            session_key=session_key,
+            agent_id=request.agent_id,
+            started_at=time.time(),
+        )
+        self._tasks[task_id] = handle
+
         from sahara_runtime.agent_loop import run_agent_loop
 
         coro = run_agent_loop(
@@ -93,19 +142,11 @@ class AgentServicer(agent_pb2_grpc.AgentServiceServicer):
             metadata=dict(request.metadata),
             container=self._container,
             on_complete=lambda tid: self._on_task_done(tid),
+            task_handle=handle,
         )
 
         async_task = asyncio.create_task(coro, name=f"agent-{task_id}")
-
-        handle = TaskHandle(
-            task=async_task,
-            task_id=task_id,
-            run_id=run_id,
-            session_key=session_key,
-            agent_id=request.agent_id,
-            started_at=time.time(),
-        )
-        self._tasks[task_id] = handle
+        handle.task = async_task
 
         return agent_pb2.SubmitTaskResponse(
             run_id=run_id,
@@ -178,9 +219,43 @@ class AgentServicer(agent_pb2_grpc.AgentServiceServicer):
         request: agent_pb2.SendInputRequest,
         context: grpc.aio.ServicerContext,
     ) -> agent_pb2.SendInputResponse:
-        await context.abort(grpc.StatusCode.UNIMPLEMENTED, "SendInput not implemented in Phase 1")
+        handle = self._tasks.get(request.task_id)
+        if handle is None:
+            await context.abort(grpc.StatusCode.NOT_FOUND, "task not found")
+
+        if not handle.waiting_for_input or handle.input_channel is None:
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "task is not waiting for input",
+            )
+
+        user_input = UserInput(
+            action=request.action,
+            text=request.input,
+            task_id=request.task_id,
+        )
+
+        try:
+            handle.input_channel.put_nowait(user_input)
+        except asyncio.QueueFull:
+            await context.abort(
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                "input channel is full",
+            )
+
+        logger.info(
+            "send_input_delivered",
+            task_id=request.task_id,
+            action=request.action,
+        )
+        return agent_pb2.SendInputResponse(delivered=True)
 
     def _on_task_done(self, task_id: str) -> None:
         handle = self._tasks.pop(task_id, None)
         if handle:
             logger.info("task_done", task_id=task_id, run_id=handle.run_id)
+
+        # Signal drain completion when all tasks finish
+        if self._draining and not self._tasks and self._drain_event:
+            self._drain_event.set()
+            logger.info("drain_complete")

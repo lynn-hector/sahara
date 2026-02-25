@@ -1,6 +1,11 @@
 """PromptBuilder — 动态拼装 System Prompt。
 
-Phase 1 最小 4 段: 身份 + 安全 + 工具指南 + 运行时信息
+段落 (按 priority 排序):
+  0. 身份
+  1. 安全
+  2. 工具指南
+  3. 技能列表 (<available_skills>)
+  10. 运行时信息
 """
 
 from __future__ import annotations
@@ -52,6 +57,7 @@ class PromptBuilder:
         model: str,
         max_iterations: int,
         tools: list[dict] | None = None,
+        skills_prompt: str = "",
     ) -> str:
         segments: list[PromptSegment] = [
             PromptSegment(name="identity", content=IDENTITY_SEGMENT, priority=0),
@@ -67,6 +73,9 @@ class PromptBuilder:
                 "Always explain what you're doing before using a tool."
             )
             segments.append(PromptSegment(name="tools", content=tool_guide, priority=2))
+
+        if skills_prompt:
+            segments.append(PromptSegment(name="skills", content=skills_prompt, priority=3))
 
         runtime_info = RUNTIME_SEGMENT_TEMPLATE.format(
             session_key=session_key,

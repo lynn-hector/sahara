@@ -28,6 +28,18 @@ type Config struct {
 
 	// API Key 用于客户端认证 (空 = 不开启认证)
 	APIKey string
+
+	// ── JWT 认证 ────────────────────────────────────
+	// 当 JWTSecret 非空时启用 JWT 模式, 否则退回 API Key 认证
+	JWTSecret   string // HS256 签名密钥
+	JWTIssuer   string // iss claim (默认 "sahara")
+	JWTAudience string // aud claim (默认 "sahara-gateway")
+	AuthDevMode bool   // 开发模式: 开放 /api/auth/token 签发端点
+}
+
+// JWTEnabled returns true when JWT authentication is configured.
+func (c *Config) JWTEnabled() bool {
+	return c.JWTSecret != ""
 }
 
 // Load 从环境变量加载配置
@@ -39,6 +51,10 @@ func Load() *Config {
 		LogLevelStr:    envOr("LOG_LEVEL", "info"),
 		AllowedOrigins: envOr("ALLOWED_ORIGINS", "*"),
 		APIKey:         envOr("API_KEY", ""),
+		JWTSecret:      envOr("JWT_SECRET", ""),
+		JWTIssuer:      envOr("JWT_ISSUER", "sahara"),
+		JWTAudience:    envOr("JWT_AUDIENCE", "sahara-gateway"),
+		AuthDevMode:    envOr("AUTH_DEV_MODE", "") == "true",
 	}
 }
 

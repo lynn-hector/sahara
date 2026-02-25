@@ -9,6 +9,7 @@ Agent Loop 核心 — 驱动 LLM 交互循环
 - SessionStore 多轮对话
 - ContextManager token 预算控制
 - Fallback: 自动重试 + Key 轮换 (429/5xx)
+- 人机交互: 高危工具确认 (SendInput / WAITING_FOR_INPUT)
 """
 
 from __future__ import annotations
@@ -27,12 +28,49 @@ from sahara_runtime.tools.executor import ToolExecutor
 
 if TYPE_CHECKING:
     from sahara_runtime.di.container import Container
+    from sahara_runtime.grpc.agent_servicer import TaskHandle
 
 logger = structlog.get_logger(__name__)
 
 TASK_TIMEOUT = 300
 MAX_LLM_RETRIES = 3
 RETRY_BACKOFF_BASE = 1.0  # seconds
+INPUT_WAIT_TIMEOUT = 120  # seconds
+
+CONFIRM_REQUIRED_TOOLS: set[str] = {"exec"}
+
+
+# ── Prometheus helpers (fail silently if prometheus_client absent) ────
+
+def _metrics_task_start(agent_id: str) -> None:
+    try:
+        from sahara_runtime.observability.metrics import TASKS_TOTAL, TASKS_ACTIVE
+        TASKS_ACTIVE.inc()
+    except Exception:
+        pass
+
+
+def _metrics_task_end(agent_id: str, status: str, start_time: float) -> None:
+    try:
+        from sahara_runtime.observability.metrics import (
+            TASKS_TOTAL, TASKS_ACTIVE, TASK_DURATION,
+        )
+        TASKS_TOTAL.labels(agent_id=agent_id, status=status).inc()
+        TASKS_ACTIVE.dec()
+        TASK_DURATION.labels(agent_id=agent_id).observe(time.time() - start_time)
+    except Exception:
+        pass
+
+
+def _metrics_llm_tokens(
+    provider: str, model: str, input_tokens: int, output_tokens: int,
+) -> None:
+    try:
+        from sahara_runtime.observability.metrics import LLM_TOKENS_TOTAL
+        LLM_TOKENS_TOTAL.labels(provider=provider, model=model, direction="input").inc(input_tokens)
+        LLM_TOKENS_TOTAL.labels(provider=provider, model=model, direction="output").inc(output_tokens)
+    except Exception:
+        pass
 
 
 async def run_agent_loop(
@@ -45,10 +83,13 @@ async def run_agent_loop(
     metadata: dict[str, str],
     container: Container,
     on_complete: Callable[[str], None] | None = None,
+    task_handle: TaskHandle | None = None,
 ) -> None:
     """Agent 核心交互循环。每个 SubmitTask 调用触发此函数。"""
     emitter: RunEmitter = container.emitter_factory.for_run(run_id, session_key, task_id)
     start_time = time.time()
+
+    _metrics_task_start(agent_id)
 
     try:
         async with asyncio.timeout(TASK_TIMEOUT):
@@ -63,6 +104,7 @@ async def run_agent_loop(
                     model_config=model_config,
                     container=container,
                     start_time=start_time,
+                    task_handle=task_handle,
                 )
             else:
                 await _run_mock_llm(
@@ -73,13 +115,18 @@ async def run_agent_loop(
                     session_store=container.session_store,
                     session_key=session_key,
                 )
+
+        _metrics_task_end(agent_id, "success", start_time)
     except TimeoutError:
+        _metrics_task_end(agent_id, "timeout", start_time)
         logger.error("task_timeout", task_id=task_id, run_id=run_id)
         await emitter.emit_run_error("task timed out", retryable=False)
     except asyncio.CancelledError:
+        _metrics_task_end(agent_id, "cancelled", start_time)
         logger.info("task_cancelled", task_id=task_id, run_id=run_id)
         await emitter.emit_abort("task cancelled by user", aborted_by="user")
     except Exception:
+        _metrics_task_end(agent_id, "error", start_time)
         logger.exception("agent_loop_error", task_id=task_id, run_id=run_id)
         await emitter.emit_run_error("internal error", retryable=True)
     finally:
@@ -176,6 +223,7 @@ async def _run_real_llm(
     model_config: ModelConfig,
     container: Container,
     start_time: float,
+    task_handle: TaskHandle | None = None,
 ) -> None:
     """Real LLM agent loop with retry + key rotation fallback."""
     tool_executor = ToolExecutor(
@@ -184,11 +232,21 @@ async def _run_real_llm(
     )
     tool_schemas = container.tool_registry.list_schemas()
 
+    # Skills: load → filter → prompt
+    skills_prompt = ""
+    if container.skill_loader and container.skill_filter:
+        from sahara_runtime.skills.prompt import build_skills_prompt
+
+        all_skills = await container.skill_loader.load_all()
+        active_skills = container.skill_filter.filter(all_skills)
+        skills_prompt = build_skills_prompt(active_skills)
+
     system_prompt = container.prompt_builder.build(
         session_key=session_key,
         model=model_config.model_id,
         max_iterations=model_config.max_iterations,
         tools=tool_schemas if tool_schemas else None,
+        skills_prompt=skills_prompt,
     )
 
     history = await _load_history(container.session_store, session_key)
@@ -223,8 +281,12 @@ async def _run_real_llm(
             emitter=emitter,
         )
 
-        total_input_tokens += usage.get("input_tokens", 0)
-        total_output_tokens += usage.get("output_tokens", 0)
+        iter_input = usage.get("input_tokens", 0)
+        iter_output = usage.get("output_tokens", 0)
+        total_input_tokens += iter_input
+        total_output_tokens += iter_output
+
+        _metrics_llm_tokens("anthropic", model_config.model_id, iter_input, iter_output)
 
         await emitter.emit_usage(
             model=model_config.model_id,
@@ -253,6 +315,20 @@ async def _run_real_llm(
 
         tool_results: list[dict] = []
         for tc in tool_calls:
+            # Human-in-the-loop: require confirmation for high-risk tools
+            if task_handle and tc["name"] in CONFIRM_REQUIRED_TOOLS:
+                confirmed = await _wait_for_tool_confirmation(
+                    tc, emitter, task_handle
+                )
+                if not confirmed:
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tc["id"],
+                        "content": "User rejected this tool execution.",
+                        "is_error": True,
+                    })
+                    continue
+
             result = await tool_executor.execute(
                 tool_call_id=tc["id"],
                 tool_name=tc["name"],
@@ -280,6 +356,67 @@ async def _run_real_llm(
     stored = await _load_history(container.session_store, session_key)
     seq_base = len(stored) + 1
     await _persist_turn(container.session_store, session_key, user_message, final_text, seq_base)
+
+
+# ── Human-in-the-Loop ────────────────────────────────
+
+
+async def _wait_for_tool_confirmation(
+    tool_call: dict,
+    emitter: RunEmitter,
+    task_handle: TaskHandle,
+) -> bool:
+    """Pause agent and wait for user to approve/reject a tool execution.
+
+    Returns True if approved, False if rejected or timed out.
+    """
+    from sahara_runtime.grpc.agent_servicer import UserInput
+    from sahara.common.v1 import common_pb2
+
+    if task_handle.input_channel is None:
+        task_handle.input_channel = asyncio.Queue(maxsize=1)
+
+    task_handle.waiting_for_input = True
+    task_handle.state = common_pb2.TASK_STATE_WAITING_FOR_INPUT
+
+    await emitter.emit_tool_confirm_required(
+        tool_call_id=tool_call["id"],
+        tool_name=tool_call["name"],
+        input_json=json.dumps(tool_call.get("input", {})),
+        risk_description=f"Tool '{tool_call['name']}' requires confirmation before execution.",
+        timeout_seconds=INPUT_WAIT_TIMEOUT,
+    )
+
+    logger.info(
+        "waiting_for_tool_confirm",
+        tool_name=tool_call["name"],
+        tool_call_id=tool_call["id"],
+        timeout=INPUT_WAIT_TIMEOUT,
+    )
+
+    try:
+        user_input: UserInput = await asyncio.wait_for(
+            task_handle.input_channel.get(),
+            timeout=INPUT_WAIT_TIMEOUT,
+        )
+        approved = user_input.action == "approve"
+        logger.info(
+            "tool_confirm_received",
+            tool_call_id=tool_call["id"],
+            action=user_input.action,
+            approved=approved,
+        )
+        return approved
+    except asyncio.TimeoutError:
+        logger.warning(
+            "tool_confirm_timeout",
+            tool_call_id=tool_call["id"],
+            timeout=INPUT_WAIT_TIMEOUT,
+        )
+        return False
+    finally:
+        task_handle.waiting_for_input = False
+        task_handle.state = common_pb2.TASK_STATE_RUNNING
 
 
 # ── Fallback: Retry + Key Rotation ──────────────────

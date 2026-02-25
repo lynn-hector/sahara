@@ -39,10 +39,27 @@ class Settings(BaseSettings):
     max_iterations: int = 20
     task_timeout_seconds: int = 300
 
+    # ── Skills ───────────────────────────────────────────
+    # defaults to <runtime_repo>/skills/ for bundled skills
+    bundled_skills_dir: str = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "skills",
+    )
+    configured_skills_dir: str = ""
+    managed_skills_dir: str = ""
+    disabled_skills: str = ""  # comma-separated skill names
+
     # ── 沙箱 ────────────────────────────────────────────
     sandbox_enabled: bool = False
-    sandbox_pool_size: int = 4
-    sandbox_image: str = "sahara-sandbox:latest"
+    sandbox_provider: str = "noop"  # "noop" | "docker" | "e2b"
+    sandbox_pool_size: int = 2
+    sandbox_image: str = "sahara-sandbox:latest"  # docker provider
+    e2b_api_key: str = ""  # e2b provider
+    e2b_template: str = "base"  # e2b provider
+    e2b_timeout: int = 300  # e2b sandbox TTL (seconds)
+
+    # ── 可观测性 ──────────────────────────────────────────
+    metrics_port: int = 9090  # Prometheus /metrics HTTP, 0 to disable
 
     # ── 日志 ────────────────────────────────────────────
     log_level: str = "INFO"

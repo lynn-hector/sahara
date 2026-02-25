@@ -23,7 +23,7 @@ dependencies = [
     # PostgreSQL
     "asyncpg>=0.30.0",
 
-    # 沙箱
+    # 沙箱 (docker provider)
     "docker>=7.1.0",
 
     # Token 计数
@@ -38,12 +38,18 @@ dependencies = [
     # 指标
     "prometheus-client>=0.21.0",
 
+    # YAML (skills frontmatter)
+    "pyyaml>=6.0",
+
     # 工具
     "ulid-py>=1.1.0",
     "psutil>=6.1.0",
 ]
 
 [project.optional-dependencies]
+e2b = [
+    "e2b>=2.0.0",
+]
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",

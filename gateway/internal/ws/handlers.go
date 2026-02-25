@@ -4,17 +4,21 @@
 //   - agent.submit: Submits a task to the Runtime via gRPC Dispatcher.
 //     Flow: parse params → bind session → subscribe to events → gRPC SubmitTask → return run_id.
 //   - agent.abort: Requests cancellation of a running task.
+//   - agent.input: Delivers user input to a waiting task (human-in-the-loop).
+//     Flow: parse params → sticky affinity lookup → gRPC SendInput → ack.
 package ws
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	agentv1 "github.com/sahara-ai/sahara/gen/sahara/agent/v1"
 	"github.com/sahara-ai/sahara/gateway/internal/dispatch"
+	"github.com/sahara-ai/sahara/gateway/internal/metrics"
 	"github.com/sahara-ai/sahara/pkg/errcode"
 )
 
@@ -39,6 +43,14 @@ type AbortParams struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// InputParams mirrors the client-side agent.input params.
+type InputParams struct {
+	TaskID string `json:"taskId"`
+	RunID  string `json:"runId,omitempty"`
+	Action string `json:"action"` // "approve" / "reject" / "input"
+	Input  string `json:"input,omitempty"`
+}
+
 // RegisterHandlers wires up all RPC method handlers.
 func RegisterHandlers(router *Router, hub *Hub, disp *dispatch.Dispatcher, sub ...SessionSubscriber) {
 	var subscriber SessionSubscriber
@@ -47,6 +59,7 @@ func RegisterHandlers(router *Router, hub *Hub, disp *dispatch.Dispatcher, sub .
 	}
 	router.Handle("agent.submit", makeSubmitHandler(hub, disp, subscriber))
 	router.Handle("agent.abort", makeAbortHandler(disp))
+	router.Handle("agent.input", makeInputHandler(disp))
 }
 
 // makeSubmitHandler creates the agent.submit RPC handler.
@@ -83,13 +96,25 @@ func makeSubmitHandler(hub *Hub, disp *dispatch.Dispatcher, subscriber SessionSu
 			},
 		}
 
+		dispatchStart := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		result, err := disp.Submit(ctx, req)
 		if err != nil {
+			var busyErr *dispatch.WorkersBusyError
+			if errors.As(err, &busyErr) {
+				metrics.OverloadRejectsTotal.Inc()
+				metrics.TasksSubmittedTotal.WithLabelValues("rejected").Inc()
+				slog.Warn("overload: all workers busy", "task_id", taskID)
+				return ErrorFrame("", errcode.GWWorkerBusy, "All workers are busy. Please retry in a moment."), nil
+			}
+			metrics.TasksSubmittedTotal.WithLabelValues("error").Inc()
 			slog.Error("submit failed", "task_id", taskID, "err", err)
 			return ErrorFrame("", errcode.GWSubmitFailed, err.Error()), nil
 		}
+
+		metrics.TasksSubmittedTotal.WithLabelValues("accepted").Inc()
+		metrics.TaskDispatchDuration.Observe(time.Since(dispatchStart).Seconds())
 
 		slog.Info("task submitted",
 			"task_id", taskID,
@@ -140,8 +165,47 @@ func makeAbortHandler(disp *dispatch.Dispatcher) HandlerFunc {
 	}
 }
 
+// makeInputHandler creates the agent.input RPC handler for human-in-the-loop interaction.
+// Uses sticky affinity to route the input to the correct Runtime Worker.
+func makeInputHandler(disp *dispatch.Dispatcher) HandlerFunc {
+	return func(conn *Conn, params json.RawMessage) (*ResFrame, error) {
+		var p InputParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return ErrorFrame("", errcode.GWInvalidParams, err.Error()), nil
+		}
+		if p.TaskID == "" || p.Action == "" {
+			return ErrorFrame("", errcode.GWInvalidParams, "taskId and action are required"), nil
+		}
+
+		validActions := map[string]bool{"approve": true, "reject": true, "input": true}
+		if !validActions[p.Action] {
+			return ErrorFrame("", errcode.GWInvalidParams, "action must be approve, reject, or input"), nil
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := disp.SendInput(ctx, p.TaskID, p.Action, p.Input); err != nil {
+			slog.Error("send_input failed", "task_id", p.TaskID, "err", err)
+			return ErrorFrame("", errcode.GWSubmitFailed, err.Error()), nil
+		}
+
+		slog.Info("input delivered", "task_id", p.TaskID, "action", p.Action, "conn_id", conn.ID)
+
+		return &ResFrame{
+			Type:   FrameTypeRes,
+			Code:   200,
+			Status: "ok",
+			Payload: map[string]any{
+				"taskId":    p.TaskID,
+				"action":    p.Action,
+				"delivered": true,
+			},
+		}, nil
+	}
+}
+
 // generateTaskID produces a unique task identifier using nanosecond timestamp.
-// TODO(phase2): replace with a distributed ID generator (e.g. ULID/Snowflake).
 func generateTaskID() string {
 	return fmt.Sprintf("task_%d", time.Now().UnixNano())
 }

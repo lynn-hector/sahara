@@ -84,6 +84,9 @@ async def serve() -> None:
 
     await server.start()
 
+    # Prometheus metrics HTTP endpoint
+    metrics_server = await _start_metrics_server(settings.metrics_port)
+
     # Graceful shutdown
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -98,9 +101,43 @@ async def serve() -> None:
     await stop_event.wait()
 
     logger.info("shutting down gRPC server...")
+    if metrics_server:
+        metrics_server.close()
+        await metrics_server.wait_closed()
     await server.stop(grace=30)
     await container.shutdown()
     logger.info("sahara-rt stopped")
+
+
+async def _start_metrics_server(port: int) -> asyncio.Server | None:
+    """Start a lightweight HTTP server exposing Prometheus /metrics."""
+    if port <= 0:
+        return None
+    try:
+        from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+
+        async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            await reader.readline()
+            body = generate_latest()
+            header = (
+                f"HTTP/1.1 200 OK\r\n"
+                f"Content-Type: {CONTENT_TYPE_LATEST}\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"\r\n"
+            )
+            writer.write(header.encode() + body)
+            await writer.drain()
+            writer.close()
+
+        srv = await asyncio.start_server(_handle, "0.0.0.0", port)
+        logger.info("prometheus metrics server started", port=port)
+        return srv
+    except ImportError:
+        logger.warning("prometheus_client not installed, /metrics disabled")
+        return None
+    except Exception:
+        logger.exception("failed to start metrics server")
+        return None
 
 
 def main() -> None:
