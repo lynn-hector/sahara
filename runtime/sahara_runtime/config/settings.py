@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     task_timeout_seconds: int = 300
 
     # ── 沙箱 ────────────────────────────────────────────
-    sandbox_enabled: bool = True
+    sandbox_enabled: bool = False
     sandbox_pool_size: int = 4
     sandbox_image: str = "sahara-sandbox:latest"
 
