@@ -1,0 +1,23 @@
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/sahara-ai/sahara/gen
+plugins:
+  # Go protobuf
+  - remote: buf.build/protocolbuffers/go
+    out: ../gen/go
+    opt: paths=source_relative
+
+  # Go gRPC
+  - remote: buf.build/grpc/go
+    out: ../gen/go
+    opt: paths=source_relative
+
+  # Python protobuf + gRPC
+  - remote: buf.build/protocolbuffers/python
+    out: ../gen/python
+
+  - remote: buf.build/grpc/python
+    out: ../gen/python

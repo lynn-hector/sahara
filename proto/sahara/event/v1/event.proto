@@ -1,0 +1,154 @@
+syntax = "proto3";
+package sahara.event.v1;
+
+option go_package = "sahara/event/v1;eventv1";
+
+// ==========================================================
+// AgentEvent: Runtime → Redis Streams → Gateway 的异步事件
+// 序列化为 protobuf bytes，通过 Redis Streams XADD 传输
+// Stream key: events:{session_key}
+// ==========================================================
+message AgentEvent {
+  // 事件唯一 ID (ULID)
+  string event_id = 1;
+
+  // 关联的执行 ID
+  string run_id = 2;
+
+  // 关联的会话标识
+  string session_key = 3;
+
+  // 关联的任务 ID
+  string task_id = 4;
+
+  // 事件类型
+  EventType type = 5;
+
+  // 事件产生时间 (unix ms)
+  int64 timestamp_ms = 6;
+
+  // 会话内递增序列号 (用于检测丢失和排序)
+  int32 seq = 7;
+
+  // 追踪 ID (OpenTelemetry trace_id)
+  string trace_id = 8;
+
+  // 事件数据 (根据 type 不同，使用不同 payload)
+  oneof payload {
+    DeltaPayload delta = 10;
+    ToolStartPayload tool_start = 11;
+    ToolResultPayload tool_result = 12;
+    RunStartPayload run_start = 13;
+    RunCompletePayload run_complete = 14;
+    RunErrorPayload run_error = 15;
+    RunAbortPayload run_abort = 16;
+    ThinkingPayload thinking = 17;
+    UsagePayload usage = 18;
+    InputRequiredPayload input_required = 19;
+    ToolConfirmRequiredPayload tool_confirm_required = 20;
+    ModelFallbackPayload model_fallback = 21;
+  }
+}
+
+// 事件类型枚举
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_DELTA = 1;                    // LLM 流式文本片段
+  EVENT_TYPE_TOOL_START = 2;               // 工具开始执行
+  EVENT_TYPE_TOOL_RESULT = 3;              // 工具执行结果
+  EVENT_TYPE_RUN_START = 4;                // Agent 运行开始
+  EVENT_TYPE_RUN_COMPLETE = 5;             // Agent 运行完成
+  EVENT_TYPE_RUN_ERROR = 6;                // Agent 运行出错
+  EVENT_TYPE_RUN_ABORT = 7;               // Agent 运行被中止
+  EVENT_TYPE_THINKING = 8;                // 模型思考中 (extended thinking)
+  EVENT_TYPE_USAGE = 9;                   // Token 用量统计
+  EVENT_TYPE_INPUT_REQUIRED = 10;          // Agent 需要用户文本输入
+  EVENT_TYPE_TOOL_CONFIRM_REQUIRED = 11;   // 高危工具需要用户确认
+  EVENT_TYPE_MODEL_FALLBACK = 12;          // 模型降级通知
+}
+
+// ── Payload 定义 ───────────────────────────────────────────
+
+message DeltaPayload {
+  string text = 1;
+  // 文本流标识 ("assistant" / "thinking")
+  string stream = 2;
+}
+
+message ToolStartPayload {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  string input_json = 3;
+}
+
+message ToolResultPayload {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  bool success = 3;
+  string output = 4;
+  int64 duration_ms = 5;
+}
+
+message RunStartPayload {
+  string agent_id = 1;
+  string model = 2;
+  int64 started_at_ms = 3;
+}
+
+message RunCompletePayload {
+  string final_text = 1;
+  int32 iterations = 2;
+  int64 duration_ms = 3;
+}
+
+message RunErrorPayload {
+  string error_code = 1;
+  string error_message = 2;
+  bool retryable = 3;
+}
+
+message RunAbortPayload {
+  string reason = 1;
+  // "user" / "system" / "timeout"
+  string aborted_by = 2;
+}
+
+message ThinkingPayload {
+  string text = 1;
+}
+
+message UsagePayload {
+  string model = 1;
+  int32 input_tokens = 2;
+  int32 output_tokens = 3;
+  int32 cache_read_tokens = 4;
+  int32 cache_write_tokens = 5;
+  int32 iteration = 6;
+}
+
+// ── 人机交互事件 Payload ───────────────────────────────────
+
+message InputRequiredPayload {
+  string input_type = 1;       // "text_input"
+  string prompt = 2;
+  int32 timeout_seconds = 3;   // 默认 120
+}
+
+message ToolConfirmRequiredPayload {
+  string input_type = 1;       // "tool_confirm"
+  string tool_call_id = 2;
+  string tool_name = 3;
+  string input_json = 4;
+  string risk_description = 5;
+  int32 timeout_seconds = 6;
+}
+
+// ── 模型降级事件 Payload ───────────────────────────────────
+
+message ModelFallbackPayload {
+  string from_model = 1;
+  string to_model = 2;
+  string reason = 3;
+  // 降级层级 (1=重试, 2=Key轮换, 3=上下文压缩, 4=模型降级链)
+  int32 fallback_layer = 4;
+}

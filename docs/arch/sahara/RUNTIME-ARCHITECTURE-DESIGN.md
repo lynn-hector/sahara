@@ -798,38 +798,38 @@ async def run_agent_loop(
     # ── 9. 交互循环 (整体受 TASK_TIMEOUT 保护) ──
     try:
         async with asyncio.timeout(TASK_TIMEOUT):
-            for iteration in range(model_config.max_iterations):
+        for iteration in range(model_config.max_iterations):
                 # 9a. 上下文管理
-                messages = await deps.context_manager.fit(
-                    messages=messages,
-                    system_prompt=system_prompt,
-                    model=model_config,
-                )
+            messages = await deps.context_manager.fit(
+                messages=messages,
+                system_prompt=system_prompt,
+                model=model_config,
+            )
 
                 # 9b. 调用 LLM (流式, 含自动重试)
                 response = await _call_llm_with_retry(
-                    client=client,
-                    model=model_config.model_id,
-                    system=system_prompt,
-                    messages=messages,
-                    tools=tool_definitions,
-                    emitter=emitter,
-                    iteration=iteration,
+                client=client,
+                model=model_config.model_id,
+                system=system_prompt,
+                messages=messages,
+                tools=tool_definitions,
+                emitter=emitter,
+                iteration=iteration,
                     key_pool=deps.model_router.key_pool,
-                )
+            )
 
-                messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "assistant", "content": response.content})
 
                 # 9c. 自然结束
-                if response.stop_reason != "tool_use":
-                    break
+            if response.stop_reason != "tool_use":
+                break
 
                 # 9d. 工具执行 (含安全检查、确认、沙箱调用, 详见 §7.8)
                 tool_results = await tool_executor.execute_tool_calls(
-                    response=response,
+                response=response,
                     task_handle=task_handle,
-                )
-                messages.append({"role": "user", "content": tool_results})
+            )
+            messages.append({"role": "user", "content": tool_results})
 
         # ── 10. RUN_COMPLETE ──
         final_text = _extract_final_text(messages)
@@ -1024,10 +1024,10 @@ async def _wait_for_user_confirmation(block, tool, sandbox, emitter, task_handle
         task_handle.waiting_for_input = False
         # 超时 → 自动拒绝, 告知 LLM
         return {
-            "type": "tool_result",
-            "tool_use_id": block.id,
+                "type": "tool_result",
+                "tool_use_id": block.id,
             "content": "用户未在规定时间内响应, 工具执行已被自动拒绝。",
-            "is_error": True,
+                "is_error": True,
         }
 
     task_handle.waiting_for_input = False
@@ -1057,34 +1057,34 @@ async def _wait_for_user_confirmation(block, tool, sandbox, emitter, task_handle
 
 async def _execute_single_tool(block, tool, sandbox, emitter):
     """执行单个工具, 发射事件, 返回结果。"""
-    await emitter.emit_tool_start(
-        tool_call_id=block.id,
-        tool_name=block.name,
-        input_json=json.dumps(block.input),
-    )
+        await emitter.emit_tool_start(
+            tool_call_id=block.id,
+            tool_name=block.name,
+            input_json=json.dumps(block.input),
+        )
 
-    start = time.monotonic()
-    try:
-        result = await tool.execute(block.input, sandbox=sandbox)
-        success = True
-    except ToolExecutionError as e:
-        result = str(e)
-        success = False
+        start = time.monotonic()
+        try:
+            result = await tool.execute(block.input, sandbox=sandbox)
+            success = True
+        except ToolExecutionError as e:
+            result = str(e)
+            success = False
 
-    duration_ms = int((time.monotonic() - start) * 1000)
+        duration_ms = int((time.monotonic() - start) * 1000)
 
-    await emitter.emit_tool_result(
-        tool_call_id=block.id,
-        tool_name=block.name,
-        success=success,
-        output=_truncate(str(result), max_chars=10_000),
-        duration_ms=duration_ms,
-    )
+        await emitter.emit_tool_result(
+            tool_call_id=block.id,
+            tool_name=block.name,
+            success=success,
+            output=_truncate(str(result), max_chars=10_000),
+            duration_ms=duration_ms,
+        )
 
     return {
-        "type": "tool_result",
-        "tool_use_id": block.id,
-        "content": str(result),
+            "type": "tool_result",
+            "tool_use_id": block.id,
+            "content": str(result),
     }
 ```
 
@@ -1950,9 +1950,9 @@ class ModelRouter:
         )
 
     def _create_client(self, provider: str, key: str) -> Any:
-        if provider == "anthropic":
+            if provider == "anthropic":
             return anthropic.AsyncAnthropic(api_key=key)
-        elif provider == "openai":
+            elif provider == "openai":
             return openai.AsyncOpenAI(api_key=key)
         raise ValueError(f"unknown provider: {provider}")
 ```
@@ -3256,12 +3256,12 @@ class ExecTool(Tool):
             raise ToolExecutionError(
                 f"Command '{cmd_prefix}' not allowed in dev mode (no sandbox)"
             )
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=timeout,
         )
         return stdout.decode() + stderr.decode()
@@ -3429,8 +3429,8 @@ class ToolRegistry:
         for tool in tools:
             # Tier 0 (Core) 不可被 blocklist 禁用, 只能被 allowlist 排除
             if tool.tier != ToolTier.CORE:
-                if policy.blocklist and tool.name in policy.blocklist:
-                    continue
+            if policy.blocklist and tool.name in policy.blocklist:
+                continue
             # disabled_tiers 按层级禁用
             if policy.disabled_tiers and tool.tier in policy.disabled_tiers:
                 continue

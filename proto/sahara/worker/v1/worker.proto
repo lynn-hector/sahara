@@ -1,0 +1,77 @@
+syntax = "proto3";
+package sahara.worker.v1;
+
+option go_package = "sahara/worker/v1;workerv1";
+
+// ==========================================================
+// WorkerService: Gateway → Runtime Worker 的运维管理
+// ==========================================================
+service WorkerService {
+  // 查询 Worker 负载与健康状态（Gateway 定期轮询，用于调度决策）
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
+  // 排空 Worker：停止接受新任务，等待现有任务完成
+  rpc Drain(DrainRequest) returns (DrainResponse);
+
+  // 热更新 Worker 配置（模型配置、并发上限等）
+  rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
+}
+
+// ── GetStatus ──────────────────────────────────────────────
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  string worker_id = 1;
+
+  // 容量信息
+  int32 active_tasks = 2;
+  int32 max_tasks = 3;
+  int32 queued_tasks = 4;
+
+  // 资源信息
+  float cpu_usage_percent = 5;
+  float memory_usage_percent = 6;
+  int64 memory_used_bytes = 7;
+
+  // 沙箱池状态
+  int32 sandbox_pool_idle = 8;
+  int32 sandbox_pool_in_use = 9;
+  int32 sandbox_pool_total = 10;
+
+  // Worker 状态
+  WorkerState state = 11;
+  int64 uptime_seconds = 12;
+  string version = 13;
+}
+
+enum WorkerState {
+  WORKER_STATE_UNSPECIFIED = 0;
+  WORKER_STATE_READY = 1;         // 正常接收任务
+  WORKER_STATE_DRAINING = 2;      // 排空中，不接受新任务
+  WORKER_STATE_STARTING = 3;      // 启动中，尚未就绪
+}
+
+// ── Drain ──────────────────────────────────────────────────
+
+message DrainRequest {
+  // 排空超时 (秒)。超时后强制中止剩余任务。0 = 使用默认值 (60s)
+  int32 timeout_seconds = 1;
+}
+
+message DrainResponse {
+  int32 remaining_tasks = 1;
+  int64 estimated_complete_at_ms = 2;
+}
+
+// ── UpdateConfig ───────────────────────────────────────────
+
+message UpdateConfigRequest {
+  int32 max_tasks = 1;
+  string model_config_json = 2;
+  string log_level = 3;
+}
+
+message UpdateConfigResponse {
+  string current_config_json = 1;
+}

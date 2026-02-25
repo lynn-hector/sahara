@@ -1,0 +1,30 @@
+# =============================================================================
+# Sahara 集成测试环境
+# 使用: docker compose -f deploy/docker-compose.test.yml up -d
+# =============================================================================
+
+services:
+  redis-test:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    command: redis-server --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 3
+
+  postgres-test:
+    image: postgres:16-alpine
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: sahara_test
+      POSTGRES_USER: sahara
+      POSTGRES_PASSWORD: test_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sahara"]
+      interval: 3s
+      timeout: 2s
+      retries: 3

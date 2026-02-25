@@ -29,6 +29,8 @@ ehthumbs.db
 *.dylib
 bin/
 dist/
+sahara-gw
+sahara-api
 
 # 测试
 *.test
@@ -36,8 +38,8 @@ dist/
 coverage.txt
 coverage.html
 
-# Go workspace
-go.work
+# Go workspace (保留 go.work 用于 monorepo)
+# go.work
 go.work.sum
 
 # vendor 目录 (如果不提交依赖)
@@ -100,10 +102,13 @@ coverage.xml
 # ===========================
 # gRPC / Protobuf
 # ===========================
-# 生成的代码 (按需取消注释)
-# *_pb2.py
-# *_pb2_grpc.py
-# *.pb.go
+# 生成代码目录 (由 proto-gen.sh 生成)
+gen/
+
+# 服务目录下的 gen 符号链接
+gateway/gen
+api/gen
+runtime/gen
 
 # ===========================
 # Docker

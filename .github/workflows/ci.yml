@@ -1,0 +1,83 @@
+# =============================================================================
+# Sahara CI Pipeline
+# 触发: PR 和 push to main
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Proto Lint ──────────────────────────────────────────
+  proto-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ github.token }}
+
+      - name: Buf lint
+        run: cd proto && buf lint
+
+      - name: Buf breaking (对比 main)
+        if: github.event_name == 'pull_request'
+        run: cd proto && buf breaking --against "https://github.com/${{ github.repository }}.git#branch=main,subdir=proto"
+
+  # ── Go ──────────────────────────────────────────────────
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Go Build (gateway)
+        run: cd gateway && go build ./...
+
+      - name: Go Build (api)
+        run: cd api && go build ./...
+
+      - name: Go Build (pkg)
+        run: cd pkg && go build ./...
+
+      - name: Go Test (gateway)
+        run: cd gateway && go test ./... -v -race
+
+      - name: Go Test (api)
+        run: cd api && go test ./... -v -race
+
+      - name: Go Vet
+        run: cd gateway && go vet ./... && cd ../api && go vet ./...
+
+  # ── Python ──────────────────────────────────────────────
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install dependencies
+        run: cd runtime && uv pip install --system ".[dev]"
+
+      - name: Ruff lint
+        run: cd runtime && ruff check .
+
+      - name: Ruff format check
+        run: cd runtime && ruff format --check .
+
+      - name: Pytest
+        run: cd runtime && pytest -v --tb=short

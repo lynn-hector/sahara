@@ -1,0 +1,176 @@
+syntax = "proto3";
+package sahara.agent.v1;
+
+option go_package = "sahara/agent/v1;agentv1";
+
+import "sahara/common/v1/common.proto";
+
+// ==========================================================
+// AgentService: Gateway → Runtime Worker 的核心任务管理
+// ==========================================================
+service AgentService {
+  // 提交 Agent 任务。
+  // 成功返回 run_id；Worker 过载返回 gRPC RESOURCE_EXHAUSTED。
+  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+
+  // 中止正在执行的任务。幂等操作：任务已结束时返回 OK。
+  rpc AbortTask(AbortTaskRequest) returns (AbortTaskResponse);
+
+  // 人机交互：将用户输入/确认投递给挂起中的 Agent 任务。
+  // 必须路由到持有该任务的 Worker（Sticky Affinity）。
+  rpc SendInput(SendInputRequest) returns (SendInputResponse);
+
+  // 查询指定任务的当前状态。
+  rpc GetTaskStatus(GetTaskStatusRequest) returns (GetTaskStatusResponse);
+
+  // 列出 Worker 上所有活跃任务（用于 Gateway 重启后的状态恢复）。
+  rpc ListActiveTasks(ListActiveTasksRequest) returns (ListActiveTasksResponse);
+}
+
+// ── SubmitTask ─────────────────────────────────────────────
+
+message SubmitTaskRequest {
+  // 全局唯一任务 ID (由 Gateway 生成, ULID 格式)
+  string task_id = 1;
+
+  // 会话标识 (格式: {agent_id}:{user_id}:{channel}:{peer_id})
+  string session_key = 2;
+
+  // Agent 配置标识
+  string agent_id = 3;
+
+  // 用户消息内容
+  UserMessage user_message = 4;
+
+  // 幂等键 (客户端传入，防止网络重试导致重复执行)
+  string idempotency_key = 5;
+
+  // 任务选项
+  TaskOptions options = 6;
+
+  // 附加元数据 (渠道信息、用户属性、A/B 实验标记等)
+  map<string, string> metadata = 7;
+}
+
+message UserMessage {
+  // 文本内容
+  string text = 1;
+
+  // 附件列表 (图片、文件等)
+  repeated Attachment attachments = 2;
+
+  // 引用的消息 ID (回复场景)
+  string reply_to_message_id = 3;
+}
+
+message Attachment {
+  string filename = 1;
+  string mime_type = 2;
+  // 内容来源：URL 或 inline bytes (小文件 <1MB)
+  oneof content {
+    string url = 3;
+    bytes data = 4;
+  }
+  int64 size_bytes = 5;
+}
+
+message TaskOptions {
+  // 覆盖默认模型 (为空则用 Agent 配置的默认模型)
+  string model_override = 1;
+
+  // 最大工具调用轮数 (0 = 使用默认值 20)
+  int32 max_iterations = 2;
+
+  // 是否启用沙箱 (为空则用 Agent 配置)
+  optional bool sandbox_enabled = 3;
+
+  // 流式事件的目标 session (用于多设备同步)
+  repeated string broadcast_session_keys = 4;
+
+  // 思考级别覆盖 ("none" / "brief" / "full")
+  string thinking_level = 5;
+}
+
+message SubmitTaskResponse {
+  // Runtime 分配的执行 ID (每次重试生成新的)
+  string run_id = 1;
+
+  // Worker 标识 (用于后续 AbortTask 精确路由)
+  string worker_id = 2;
+
+  // 任务创建时间
+  int64 accepted_at_ms = 3;
+}
+
+// ── AbortTask ──────────────────────────────────────────────
+
+message AbortTaskRequest {
+  string task_id = 1;
+  string run_id = 2;
+  // 中止原因 (用于审计日志)
+  string reason = 3;
+}
+
+message AbortTaskResponse {
+  // 任务在中止前的状态
+  sahara.common.v1.TaskState previous_state = 1;
+}
+
+// ── SendInput (Phase 2) ───────────────────────────────────
+
+message SendInputRequest {
+  string task_id = 1;
+  string run_id = 2;
+
+  // 用户动作: "approve" / "reject" / "input"
+  string action = 3;
+
+  // 用户输入文本 (action="input" 时必填)
+  string input = 4;
+}
+
+message SendInputResponse {
+  bool delivered = 1;
+}
+
+// ── GetTaskStatus ──────────────────────────────────────────
+
+message GetTaskStatusRequest {
+  string task_id = 1;
+  string run_id = 2;
+}
+
+message GetTaskStatusResponse {
+  string task_id = 1;
+  string run_id = 2;
+  string session_key = 3;
+  sahara.common.v1.TaskState state = 4;
+
+  int64 started_at_ms = 5;
+  int64 finished_at_ms = 6;
+  int32 current_iteration = 7;
+  int32 total_tokens_used = 8;
+
+  string error_message = 9;
+  bool waiting_for_input = 10;
+  string current_model = 11;
+}
+
+// ── ListActiveTasks ────────────────────────────────────────
+
+message ListActiveTasksRequest {
+  string session_key_filter = 1;
+}
+
+message ListActiveTasksResponse {
+  repeated ActiveTask tasks = 1;
+}
+
+message ActiveTask {
+  string task_id = 1;
+  string run_id = 2;
+  string session_key = 3;
+  sahara.common.v1.TaskState state = 4;
+  int64 started_at_ms = 5;
+  int32 current_iteration = 6;
+}

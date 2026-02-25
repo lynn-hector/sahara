@@ -1,0 +1,31 @@
+syntax = "proto3";
+package sahara.common.v1;
+
+option go_package = "sahara/common/v1;commonv1";
+
+// 任务状态 (全生命周期)
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_QUEUED = 1;                 // 已接受，排队中
+  TASK_STATE_RUNNING = 2;                // 正在执行
+  TASK_STATE_COMPLETED = 3;              // 正常完成
+  TASK_STATE_FAILED = 4;                 // 执行出错
+  TASK_STATE_ABORTED = 5;               // 被主动中止
+  TASK_STATE_TIMEOUT = 6;               // 超时
+  TASK_STATE_WAITING_FOR_INPUT = 7;     // 挂起，等待用户输入或确认
+}
+
+// 错误详情 (附加在 gRPC Status.details 中)
+message ErrorDetail {
+  // 业务错误码 (Sahara 定义的错误码，非 gRPC 状态码)
+  string error_code = 1;
+
+  // 人类可读的错误描述
+  string message = 2;
+
+  // 相关字段名 (用于参数校验错误)
+  string field = 3;
+
+  // 附加信息
+  map<string, string> metadata = 4;
+}
