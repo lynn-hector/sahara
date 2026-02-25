@@ -118,7 +118,14 @@ class WorkerServicer(worker_pb2_grpc.WorkerServiceServicer):
 
     @staticmethod
     def _get_resource_usage() -> tuple[float, float, int]:
-        """获取当前进程的 CPU 和内存使用率。"""
+        """获取当前进程的 CPU 和内存使用率。
+
+        优先使用 psutil (精确), 降级到 resource 模块 (仅内存峰值)。
+        macOS 和 Linux 的 ru_maxrss 单位不同, 需分别处理。
+
+        Returns:
+            (cpu_percent, memory_percent, memory_bytes)
+        """
         try:
             import resource
 
@@ -143,4 +150,5 @@ class WorkerServicer(worker_pb2_grpc.WorkerServiceServicer):
                 return 0.0, 0.0, mem_bytes
 
         except Exception:
+            logger.debug("resource_usage_error", exc_info=True)
             return 0.0, 0.0, 0

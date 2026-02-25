@@ -6,6 +6,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/sahara-ai/sahara/gen v0.0.0
+	github.com/sahara-ai/sahara/pkg v0.0.0
 	google.golang.org/grpc v1.79.1
 	google.golang.org/protobuf v1.36.11
 )
@@ -20,4 +21,7 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251202230838-ff82c1b0f217 // indirect
 )
 
-replace github.com/sahara-ai/sahara/gen => ../gen/go
+replace (
+	github.com/sahara-ai/sahara/gen => ../gen/go
+	github.com/sahara-ai/sahara/pkg => ../pkg
+)

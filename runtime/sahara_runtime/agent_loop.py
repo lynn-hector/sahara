@@ -8,6 +8,7 @@ Agent Loop 核心 — 驱动 LLM 交互循环
 - Mock LLM fallback (无 API key 时)
 - SessionStore 多轮对话
 - ContextManager token 预算控制
+- Fallback: 自动重试 + Key 轮换 (429/5xx)
 """
 
 from __future__ import annotations
@@ -19,8 +20,6 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
 
-from sahara_runtime.context.manager import ContextManager
-from sahara_runtime.context.token_counter import TokenCounter
 from sahara_runtime.events.emitter import RunEmitter
 from sahara_runtime.memory.session_store import SessionMessage, SessionStore
 from sahara_runtime.model_router.router import ModelConfig
@@ -32,8 +31,8 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 TASK_TIMEOUT = 300
-_token_counter = TokenCounter()
-_context_manager = ContextManager(_token_counter)
+MAX_LLM_RETRIES = 3
+RETRY_BACKOFF_BASE = 1.0  # seconds
 
 
 async def run_agent_loop(
@@ -88,6 +87,9 @@ async def run_agent_loop(
             on_complete(task_id)
 
 
+# ── Session 持久化 ──────────────────────────────────
+
+
 async def _persist_turn(
     store: SessionStore | None,
     session_key: str,
@@ -95,7 +97,10 @@ async def _persist_turn(
     assistant_text: str,
     seq_base: int,
 ) -> None:
-    """将一轮 user + assistant 写入 SessionStore。"""
+    """将一轮对话 (user + assistant) 持久化到 SessionStore。
+
+    seq_base 用于消息排序: user 消息 = seq_base, assistant 消息 = seq_base + 1。
+    """
     if store is None:
         return
     try:
@@ -115,18 +120,18 @@ async def _load_history(
     store: SessionStore | None,
     session_key: str,
 ) -> list[dict[str, Any]]:
-    """从 SessionStore 加载历史消息, 转为 Anthropic messages 格式。"""
+    """从 SessionStore 加载历史消息, 转换为 LLM messages 格式 [{role, content}, ...]。"""
     if store is None:
         return []
     try:
         stored = await store.load(session_key)
-        messages = []
-        for msg in stored:
-            messages.append({"role": msg.role, "content": msg.content})
-        return messages
+        return [{"role": msg.role, "content": msg.content} for msg in stored]
     except Exception:
         logger.warning("session_load_failed", session_key=session_key, exc_info=True)
         return []
+
+
+# ── Mock LLM ────────────────────────────────────────
 
 
 async def _run_mock_llm(
@@ -138,7 +143,7 @@ async def _run_mock_llm(
     session_store: SessionStore | None = None,
     session_key: str = "",
 ) -> None:
-    """Mock LLM: simulates streaming by emitting deltas for a canned response."""
+    """Mock LLM — 无 API key 时的降级路径, 回显用户输入并模拟流式推送。"""
     response = f'Hello from Sahara Runtime! You said: "{user_message}"'
 
     chunks = [response[i : i + 10] for i in range(0, len(response), 10)]
@@ -160,6 +165,9 @@ async def _run_mock_llm(
         await _persist_turn(session_store, session_key, user_message, response, seq_base)
 
 
+# ── Real LLM with Fallback ──────────────────────────
+
+
 async def _run_real_llm(
     *,
     emitter: RunEmitter,
@@ -169,8 +177,7 @@ async def _run_real_llm(
     container: Container,
     start_time: float,
 ) -> None:
-    """Run the full Anthropic SDK agent loop with tool use and session history."""
-    client = container.model_router.get_client(session_key, model_config)
+    """Real LLM agent loop with retry + key rotation fallback."""
     tool_executor = ToolExecutor(
         container.tool_registry,
         sandbox_manager=container.sandbox_manager,
@@ -184,19 +191,21 @@ async def _run_real_llm(
         tools=tool_schemas if tool_schemas else None,
     )
 
-    # Load conversation history
     history = await _load_history(container.session_store, session_key)
     messages: list[dict[str, Any]] = history + [
         {"role": "user", "content": user_message},
     ]
 
-    # Fit to context window
-    system_tokens = _token_counter.count_system(system_prompt)
-    messages = _context_manager.fit_messages(
-        messages,
-        max_context_tokens=model_config.max_context_tokens,
-        system_tokens=system_tokens,
-    )
+    # Fit to context window via Container's context_manager
+    ctx_mgr = container.context_manager
+    tk_counter = container.token_counter
+    if ctx_mgr and tk_counter:
+        system_tokens = tk_counter.count_system(system_prompt)
+        messages = ctx_mgr.fit_messages(
+            messages,
+            max_context_tokens=model_config.max_context_tokens,
+            system_tokens=system_tokens,
+        )
 
     final_text = ""
     total_input_tokens = 0
@@ -204,18 +213,15 @@ async def _run_real_llm(
     iteration = 0
 
     for iteration in range(1, model_config.max_iterations + 1):
-        try:
-            response_text, tool_calls, usage = await _call_anthropic_stream(
-                client=client,
-                model=model_config.model_id,
-                system=system_prompt,
-                messages=messages,
-                tools=tool_schemas if tool_schemas else None,
-                emitter=emitter,
-            )
-        except Exception as exc:
-            _handle_llm_error(exc, container, session_key)
-            raise
+        response_text, tool_calls, usage = await _call_with_fallback(
+            container=container,
+            session_key=session_key,
+            model_config=model_config,
+            system=system_prompt,
+            messages=messages,
+            tools=tool_schemas if tool_schemas else None,
+            emitter=emitter,
+        )
 
         total_input_tokens += usage.get("input_tokens", 0)
         total_output_tokens += usage.get("output_tokens", 0)
@@ -271,38 +277,114 @@ async def _run_real_llm(
         duration_ms=duration_ms,
     )
 
-    # Persist turn to session store
     stored = await _load_history(container.session_store, session_key)
     seq_base = len(stored) + 1
     await _persist_turn(container.session_store, session_key, user_message, final_text, seq_base)
 
 
-def _handle_llm_error(exc: Exception, container: Container, session_key: str) -> None:
-    """Handle LLM API errors with proper key rotation reporting."""
-    status_code = 0
-    exc_type = type(exc).__name__
+# ── Fallback: Retry + Key Rotation ──────────────────
 
+
+async def _call_with_fallback(
+    *,
+    container: Container,
+    session_key: str,
+    model_config: ModelConfig,
+    system: str,
+    messages: list[dict],
+    tools: list[dict] | None,
+    emitter: RunEmitter,
+) -> tuple[str, list[dict], dict]:
+    """LLM 调用 with 自动重试 + Key 轮换。
+
+    Fallback 策略:
+    1. 首次调用: 使用当前 session 绑定的 client
+    2. 429/5xx/连接错误: 等待 backoff → 轮换 Key → 重建 client → 重试
+    3. 401/403: 熔断当前 Key → 轮换 → 重试
+    4. 超过 MAX_LLM_RETRIES: 抛出最后一个异常
+    """
+    last_exc: Exception | None = None
+
+    for attempt in range(1, MAX_LLM_RETRIES + 1):
+        try:
+            client = container.model_router.get_client(session_key, model_config)
+            return await _call_anthropic_stream(
+                client=client,
+                model=model_config.model_id,
+                system=system,
+                messages=messages,
+                tools=tools,
+                emitter=emitter,
+            )
+        except Exception as exc:
+            last_exc = exc
+            status_code = _extract_status_code(exc)
+            retryable = _is_retryable(status_code, exc)
+
+            logger.warning(
+                "llm_call_failed",
+                attempt=attempt,
+                max_retries=MAX_LLM_RETRIES,
+                error_type=type(exc).__name__,
+                status_code=status_code,
+                retryable=retryable,
+                session_key=session_key,
+            )
+
+            if status_code:
+                container.model_router.report_key_error(session_key, status_code)
+
+            if not retryable or attempt >= MAX_LLM_RETRIES:
+                raise
+
+            # Rotate key: release current binding, next get_client picks a new key
+            container.model_router.release_session(session_key)
+
+            backoff = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+            logger.info("llm_retry_backoff", seconds=backoff, attempt=attempt)
+            await asyncio.sleep(backoff)
+
+    raise last_exc  # type: ignore[misc]
+
+
+def _extract_status_code(exc: Exception) -> int:
+    """从 SDK 异常中提取 HTTP 状态码。
+
+    优先检测 anthropic.APIStatusError, 然后回退到通用的 .status_code 属性。
+    返回 0 表示无法提取。
+    """
     try:
         import anthropic
 
-        if isinstance(exc, anthropic.AuthenticationError):
-            status_code = 401
-        elif isinstance(exc, anthropic.RateLimitError):
-            status_code = 429
-        elif isinstance(exc, anthropic.APIStatusError):
-            status_code = exc.status_code
+        if isinstance(exc, anthropic.APIStatusError):
+            return exc.status_code
     except ImportError:
         pass
 
-    if status_code:
-        container.model_router.report_key_error(session_key, status_code)
+    if hasattr(exc, "status_code"):
+        return getattr(exc, "status_code")
+    return 0
 
-    logger.error(
-        "llm_api_error",
-        error_type=exc_type,
-        status_code=status_code,
-        session_key=session_key,
-    )
+
+def _is_retryable(status_code: int, exc: Exception) -> bool:
+    """判断 LLM 调用异常是否可通过重试/Key 轮换恢复。
+
+    可重试条件:
+        - 429 (rate limited) / 5xx (server error) / 529 (overloaded) → 退避重试
+        - 401/403 (auth error) → 当前 key 被熔断, 轮换到下一个 key 重试
+        - 异常类名包含 "timeout" 或 "connection" → 网络层重试
+    """
+    if status_code in (429, 500, 502, 503, 529):
+        return True
+    if status_code in (401, 403):
+        return True
+    exc_name = type(exc).__name__
+    if "timeout" in exc_name.lower() or "connection" in exc_name.lower():
+        return True
+    return False
+
+
+# ── Anthropic Stream ─────────────────────────────────
 
 
 async def _call_anthropic_stream(
@@ -314,7 +396,22 @@ async def _call_anthropic_stream(
     tools: list[dict] | None,
     emitter: RunEmitter,
 ) -> tuple[str, list[dict], dict]:
-    """Call Anthropic messages API with streaming. Returns (text, tool_calls, usage)."""
+    """通过 Anthropic Messages API 进行流式调用。
+
+    处理以下 SSE 事件类型:
+        - message_start:        提取 input_tokens
+        - content_block_start:  检测 tool_use block, 初始化 tool 状态
+        - content_block_delta:  累积 text / tool JSON / thinking 内容,
+                                text_delta 实时通过 emitter 推送给客户端
+        - content_block_stop:   解析 tool JSON → tool_calls 列表
+        - message_delta:        提取 output_tokens
+
+    Returns:
+        (response_text, tool_calls, usage_info)
+        - response_text: 拼接的纯文本输出
+        - tool_calls: [{id, name, input}, ...] 如果 LLM 请求工具调用
+        - usage_info: {"input_tokens": N, "output_tokens": N}
+    """
     kwargs: dict[str, Any] = {
         "model": model,
         "max_tokens": 8192,

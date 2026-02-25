@@ -98,13 +98,22 @@ func (c *Consumer) Run(ctx context.Context) {
 		}
 
 		for _, stream := range results {
+			lastID := ""
 			for _, msg := range stream.Messages {
 				c.handleMessage(stream.Stream, msg)
+				lastID = msg.ID
+			}
+			if lastID != "" {
+				c.mu.Lock()
+				c.streams[stream.Stream] = lastID
+				c.mu.Unlock()
 			}
 		}
 	}
 }
 
+// handleMessage deserializes a single Redis Stream entry into a protobuf AgentEvent,
+// converts it to a WebSocket EventFrame, and pushes it into the Aggregator.
 func (c *Consumer) handleMessage(streamKey string, msg redis.XMessage) {
 	dataStr, ok := msg.Values["data"]
 	if !ok {
@@ -127,14 +136,12 @@ func (c *Consumer) handleMessage(streamKey string, msg redis.XMessage) {
 		return
 	}
 
-	c.mu.Lock()
-	c.streams[streamKey] = msg.ID
-	c.mu.Unlock()
-
 	frame := eventToFrame(&event)
 	c.aggregator.Push(event.GetSessionKey(), frame)
 }
 
+// eventToFrame maps a protobuf AgentEvent to a WebSocket EventFrame.
+// Each event type is converted into a JSON-friendly payload map.
 func eventToFrame(e *eventv1.AgentEvent) *ws.EventFrame {
 	eventName := eventTypeName(e.GetType())
 
@@ -201,6 +208,8 @@ func eventToFrame(e *eventv1.AgentEvent) *ws.EventFrame {
 	)
 }
 
+// eventTypeName converts a protobuf EventType enum to the client-facing dot-notation string
+// (e.g. EVENT_TYPE_DELTA → "agent.delta").
 func eventTypeName(t eventv1.EventType) string {
 	switch t {
 	case eventv1.EventType_EVENT_TYPE_DELTA:

@@ -1,3 +1,7 @@
+// Package config loads Gateway configuration from environment variables.
+//
+// All settings have sensible defaults for local development.
+// In production, set ADDR, REDIS_URL, RUNTIME_ADDRS, ALLOWED_ORIGINS, API_KEY.
 package config
 
 import (
@@ -18,15 +22,23 @@ type Config struct {
 
 	// 日志级别 ("debug" / "info" / "warn" / "error")
 	LogLevelStr string
+
+	// 允许的 WebSocket 来源 (逗号分隔, "*" 表示全部允许, 默认开发模式允许全部)
+	AllowedOrigins string
+
+	// API Key 用于客户端认证 (空 = 不开启认证)
+	APIKey string
 }
 
 // Load 从环境变量加载配置
 func Load() *Config {
 	return &Config{
-		Addr:         envOr("ADDR", ":8080"),
-		RedisURL:     envOr("REDIS_URL", "redis://localhost:6379"),
-		RuntimeAddrs: envOr("RUNTIME_ADDRS", "localhost:50051"),
-		LogLevelStr:  envOr("LOG_LEVEL", "info"),
+		Addr:           envOr("ADDR", ":8080"),
+		RedisURL:       envOr("REDIS_URL", "redis://localhost:6379"),
+		RuntimeAddrs:   envOr("RUNTIME_ADDRS", "localhost:50051"),
+		LogLevelStr:    envOr("LOG_LEVEL", "info"),
+		AllowedOrigins: envOr("ALLOWED_ORIGINS", "*"),
+		APIKey:         envOr("API_KEY", ""),
 	}
 }
 

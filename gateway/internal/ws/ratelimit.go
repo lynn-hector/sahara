@@ -1,3 +1,11 @@
+// ratelimit.go implements per-connection rate limiting using a sliding window algorithm.
+//
+// Design: each connection maintains a sorted list of recent request timestamps.
+// On each Allow() call, expired entries (older than 1s) are evicted, then the
+// current count is compared against maxRPS. This is simple and memory-efficient
+// for the expected connection scale (< 10K connections).
+//
+// Phase 2 will add user-level and global-level rate limiting.
 package ws
 
 import (

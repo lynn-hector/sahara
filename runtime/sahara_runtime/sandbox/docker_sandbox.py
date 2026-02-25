@@ -6,15 +6,11 @@ Phase 1: 预创建 N 个 idle 容器, 分配/回收/补充。
 from __future__ import annotations
 
 import asyncio
-import uuid
-from typing import TYPE_CHECKING
+from typing import Any
 
 import structlog
 
 from sahara_runtime.sandbox.base import Sandbox, SandboxManager
-
-if TYPE_CHECKING:
-    pass
 
 logger = structlog.get_logger(__name__)
 
@@ -22,7 +18,7 @@ logger = structlog.get_logger(__name__)
 class DockerSandbox(Sandbox):
     """基于 Docker 容器的沙箱实例。"""
 
-    def __init__(self, container_id: str, docker_client: any) -> None:
+    def __init__(self, container_id: str, docker_client: Any) -> None:
         self._container_id = container_id
         self._docker = docker_client
 

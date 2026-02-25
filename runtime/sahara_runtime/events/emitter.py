@@ -3,16 +3,12 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
 
 import structlog
 import ulid
 
 from sahara.event.v1 import event_pb2
 from sahara_runtime.events.backend import EventBackend
-
-if TYPE_CHECKING:
-    pass
 
 logger = structlog.get_logger(__name__)
 

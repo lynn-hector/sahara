@@ -31,6 +31,7 @@ class RedisStreamsBackend(EventBackend):
         try:
             return await self._redis.ping()
         except Exception:
+            logger.warning("redis_health_check_failed", exc_info=True)
             return False
 
     async def close(self) -> None:

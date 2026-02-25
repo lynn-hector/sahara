@@ -1,3 +1,11 @@
+// aggregator.go batches high-frequency delta events to reduce WebSocket frame overhead.
+//
+// Strategy:
+//   - Non-delta events (run_start, tool_result, etc.) flush the buffer immediately
+//     before being forwarded, so ordering is preserved.
+//   - Delta events accumulate in a per-session buffer. The buffer is flushed when:
+//     (a) it reaches maxBufferSize (4 KB), (b) flushInterval (150ms) timer fires,
+//     or (c) a non-delta event arrives for the same session.
 package broadcast
 
 import (

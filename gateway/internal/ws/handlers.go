@@ -1,3 +1,9 @@
+// handlers.go defines the WebSocket RPC method handlers.
+//
+// Supported methods:
+//   - agent.submit: Submits a task to the Runtime via gRPC Dispatcher.
+//     Flow: parse params → bind session → subscribe to events → gRPC SubmitTask → return run_id.
+//   - agent.abort: Requests cancellation of a running task.
 package ws
 
 import (
@@ -9,6 +15,7 @@ import (
 
 	agentv1 "github.com/sahara-ai/sahara/gen/sahara/agent/v1"
 	"github.com/sahara-ai/sahara/gateway/internal/dispatch"
+	"github.com/sahara-ai/sahara/pkg/errcode"
 )
 
 // SessionSubscriber allows the handler to subscribe the broadcast consumer to a session.
@@ -42,14 +49,18 @@ func RegisterHandlers(router *Router, hub *Hub, disp *dispatch.Dispatcher, sub .
 	router.Handle("agent.abort", makeAbortHandler(disp))
 }
 
+// makeSubmitHandler creates the agent.submit RPC handler.
+// On each call it: validates params, binds the WS connection to the session,
+// subscribes the broadcast consumer to the session's Redis Stream,
+// then dispatches the task to a Runtime Worker via gRPC.
 func makeSubmitHandler(hub *Hub, disp *dispatch.Dispatcher, subscriber SessionSubscriber) HandlerFunc {
 	return func(conn *Conn, params json.RawMessage) (*ResFrame, error) {
 		var p SubmitParams
 		if err := json.Unmarshal(params, &p); err != nil {
-			return NewErrorResFrame("", 400, "INVALID_PARAMS", err.Error(), false), nil
+			return ErrorFrame("", errcode.GWInvalidParams, err.Error()), nil
 		}
 		if p.SessionKey == "" || p.Text == "" {
-			return NewErrorResFrame("", 400, "INVALID_PARAMS", "sessionKey and text are required", false), nil
+			return ErrorFrame("", errcode.GWInvalidParams, "sessionKey and text are required"), nil
 		}
 
 		taskID := generateTaskID()
@@ -77,7 +88,7 @@ func makeSubmitHandler(hub *Hub, disp *dispatch.Dispatcher, subscriber SessionSu
 		result, err := disp.Submit(ctx, req)
 		if err != nil {
 			slog.Error("submit failed", "task_id", taskID, "err", err)
-			return NewErrorResFrame("", 503, "SUBMIT_FAILED", err.Error(), true), nil
+			return ErrorFrame("", errcode.GWSubmitFailed, err.Error()), nil
 		}
 
 		slog.Info("task submitted",
@@ -101,14 +112,16 @@ func makeSubmitHandler(hub *Hub, disp *dispatch.Dispatcher, subscriber SessionSu
 	}
 }
 
+// makeAbortHandler creates the agent.abort RPC handler.
+// Phase 1: simplified — logs the abort request without worker affinity routing.
 func makeAbortHandler(disp *dispatch.Dispatcher) HandlerFunc {
 	return func(conn *Conn, params json.RawMessage) (*ResFrame, error) {
 		var p AbortParams
 		if err := json.Unmarshal(params, &p); err != nil {
-			return NewErrorResFrame("", 400, "INVALID_PARAMS", err.Error(), false), nil
+			return ErrorFrame("", errcode.GWInvalidParams, err.Error()), nil
 		}
 		if p.TaskID == "" {
-			return NewErrorResFrame("", 400, "INVALID_PARAMS", "taskId is required", false), nil
+			return ErrorFrame("", errcode.GWInvalidParams, "taskId is required"), nil
 		}
 
 		// Phase 1 simplified: we don't track which worker has the task yet,
@@ -127,6 +140,8 @@ func makeAbortHandler(disp *dispatch.Dispatcher) HandlerFunc {
 	}
 }
 
+// generateTaskID produces a unique task identifier using nanosecond timestamp.
+// TODO(phase2): replace with a distributed ID generator (e.g. ULID/Snowflake).
 func generateTaskID() string {
 	return fmt.Sprintf("task_%d", time.Now().UnixNano())
 }

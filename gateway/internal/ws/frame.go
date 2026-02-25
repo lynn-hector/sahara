@@ -1,9 +1,20 @@
+// frame.go defines the three WebSocket frame types for the Sahara protocol:
+//
+//   - ReqFrame  (client → server): JSON-RPC style request with method + params
+//   - ResFrame  (server → client): response with status code + payload or error
+//   - EventFrame(server → client): push event from Runtime via broadcast consumer
+//
+// Wire format example (req):
+//
+//	{"type":"req","id":"r1","method":"agent.submit","params":{...}}
 package ws
 
 import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/sahara-ai/sahara/pkg/errcode"
 )
 
 // FrameType defines the type of a WebSocket frame.
@@ -80,7 +91,23 @@ func NewResFrame(reqID string, status string, payload any) *ResFrame {
 	}
 }
 
-// NewErrorResFrame builds an error response frame.
+// ErrorFrame builds an error response from an errcode.Code.
+// HTTP status code, reason string and retryable flag are derived from the Code metadata.
+func ErrorFrame(reqID string, c errcode.Code, message string) *ResFrame {
+	return &ResFrame{
+		Type:   FrameTypeRes,
+		ID:     reqID,
+		Code:   c.HTTP,
+		Status: "error",
+		Error: &ResError{
+			Reason:    c.Value,
+			Message:   message,
+			Retryable: c.Retryable,
+		},
+	}
+}
+
+// NewErrorResFrame builds an error response frame (legacy, prefer ErrorFrame).
 func NewErrorResFrame(reqID string, code int, reason, message string, retryable bool) *ResFrame {
 	return &ResFrame{
 		Type:   FrameTypeRes,
