@@ -22,6 +22,7 @@ class ToolDef:
     func: ToolFunc
     tier: int = 0  # 0=core, 1=extended, 2=web, 3=plugin
     source: str = "builtin"  # plugin system 预留
+    sandboxed: bool = False  # True = 通过 SandboxManager 执行
 
 
 class ToolRegistry:

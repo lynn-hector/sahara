@@ -65,4 +65,5 @@ READ_TOOL = ToolDef(
     },
     func=read_file,
     tier=0,
+    sandboxed=True,
 )

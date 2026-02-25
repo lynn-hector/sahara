@@ -6,6 +6,8 @@ Agent Loop 核心 — 驱动 LLM 交互循环
 - 工具调用循环 (max N iterations)
 - thinking content blocks
 - Mock LLM fallback (无 API key 时)
+- SessionStore 多轮对话
+- ContextManager token 预算控制
 """
 
 from __future__ import annotations
@@ -17,7 +19,10 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
 
+from sahara_runtime.context.manager import ContextManager
+from sahara_runtime.context.token_counter import TokenCounter
 from sahara_runtime.events.emitter import RunEmitter
+from sahara_runtime.memory.session_store import SessionMessage, SessionStore
 from sahara_runtime.model_router.router import ModelConfig
 from sahara_runtime.tools.executor import ToolExecutor
 
@@ -27,6 +32,8 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 TASK_TIMEOUT = 300
+_token_counter = TokenCounter()
+_context_manager = ContextManager(_token_counter)
 
 
 async def run_agent_loop(
@@ -64,6 +71,8 @@ async def run_agent_loop(
                     user_message=user_message,
                     model=model_config.model_id,
                     start_time=start_time,
+                    session_store=container.session_store,
+                    session_key=session_key,
                 )
     except TimeoutError:
         logger.error("task_timeout", task_id=task_id, run_id=run_id)
@@ -79,12 +88,55 @@ async def run_agent_loop(
             on_complete(task_id)
 
 
+async def _persist_turn(
+    store: SessionStore | None,
+    session_key: str,
+    user_message: str,
+    assistant_text: str,
+    seq_base: int,
+) -> None:
+    """将一轮 user + assistant 写入 SessionStore。"""
+    if store is None:
+        return
+    try:
+        await store.append(
+            session_key,
+            SessionMessage(role="user", content=user_message, seq=seq_base),
+        )
+        await store.append(
+            session_key,
+            SessionMessage(role="assistant", content=assistant_text, seq=seq_base + 1),
+        )
+    except Exception:
+        logger.warning("session_persist_failed", session_key=session_key, exc_info=True)
+
+
+async def _load_history(
+    store: SessionStore | None,
+    session_key: str,
+) -> list[dict[str, Any]]:
+    """从 SessionStore 加载历史消息, 转为 Anthropic messages 格式。"""
+    if store is None:
+        return []
+    try:
+        stored = await store.load(session_key)
+        messages = []
+        for msg in stored:
+            messages.append({"role": msg.role, "content": msg.content})
+        return messages
+    except Exception:
+        logger.warning("session_load_failed", session_key=session_key, exc_info=True)
+        return []
+
+
 async def _run_mock_llm(
     *,
     emitter: RunEmitter,
     user_message: str,
     model: str,
     start_time: float,
+    session_store: SessionStore | None = None,
+    session_key: str = "",
 ) -> None:
     """Mock LLM: simulates streaming by emitting deltas for a canned response."""
     response = f'Hello from Sahara Runtime! You said: "{user_message}"'
@@ -102,6 +154,11 @@ async def _run_mock_llm(
         final_text=response, iterations=1, duration_ms=duration_ms
     )
 
+    if session_store and session_key:
+        stored = await session_store.load(session_key)
+        seq_base = (stored[-1].seq + 1) if stored else 1
+        await _persist_turn(session_store, session_key, user_message, response, seq_base)
+
 
 async def _run_real_llm(
     *,
@@ -112,9 +169,12 @@ async def _run_real_llm(
     container: Container,
     start_time: float,
 ) -> None:
-    """Run the full Anthropic SDK agent loop with tool use."""
+    """Run the full Anthropic SDK agent loop with tool use and session history."""
     client = container.model_router.get_client(session_key, model_config)
-    tool_executor = ToolExecutor(container.tool_registry)
+    tool_executor = ToolExecutor(
+        container.tool_registry,
+        sandbox_manager=container.sandbox_manager,
+    )
     tool_schemas = container.tool_registry.list_schemas()
 
     system_prompt = container.prompt_builder.build(
@@ -124,23 +184,38 @@ async def _run_real_llm(
         tools=tool_schemas if tool_schemas else None,
     )
 
-    messages: list[dict[str, Any]] = [
+    # Load conversation history
+    history = await _load_history(container.session_store, session_key)
+    messages: list[dict[str, Any]] = history + [
         {"role": "user", "content": user_message},
     ]
+
+    # Fit to context window
+    system_tokens = _token_counter.count_system(system_prompt)
+    messages = _context_manager.fit_messages(
+        messages,
+        max_context_tokens=model_config.max_context_tokens,
+        system_tokens=system_tokens,
+    )
 
     final_text = ""
     total_input_tokens = 0
     total_output_tokens = 0
+    iteration = 0
 
     for iteration in range(1, model_config.max_iterations + 1):
-        response_text, tool_calls, usage = await _call_anthropic_stream(
-            client=client,
-            model=model_config.model_id,
-            system=system_prompt,
-            messages=messages,
-            tools=tool_schemas if tool_schemas else None,
-            emitter=emitter,
-        )
+        try:
+            response_text, tool_calls, usage = await _call_anthropic_stream(
+                client=client,
+                model=model_config.model_id,
+                system=system_prompt,
+                messages=messages,
+                tools=tool_schemas if tool_schemas else None,
+                emitter=emitter,
+            )
+        except Exception as exc:
+            _handle_llm_error(exc, container, session_key)
+            raise
 
         total_input_tokens += usage.get("input_tokens", 0)
         total_output_tokens += usage.get("output_tokens", 0)
@@ -158,7 +233,6 @@ async def _run_real_llm(
             final_text = response_text
             break
 
-        # Build assistant message with text + tool_use blocks
         assistant_content: list[dict] = []
         if response_text:
             assistant_content.append({"type": "text", "text": response_text})
@@ -171,7 +245,6 @@ async def _run_real_llm(
             })
         messages.append({"role": "assistant", "content": assistant_content})
 
-        # Execute tools and build tool_result messages
         tool_results: list[dict] = []
         for tc in tool_calls:
             result = await tool_executor.execute(
@@ -196,6 +269,39 @@ async def _run_real_llm(
         final_text=final_text,
         iterations=iteration,
         duration_ms=duration_ms,
+    )
+
+    # Persist turn to session store
+    stored = await _load_history(container.session_store, session_key)
+    seq_base = len(stored) + 1
+    await _persist_turn(container.session_store, session_key, user_message, final_text, seq_base)
+
+
+def _handle_llm_error(exc: Exception, container: Container, session_key: str) -> None:
+    """Handle LLM API errors with proper key rotation reporting."""
+    status_code = 0
+    exc_type = type(exc).__name__
+
+    try:
+        import anthropic
+
+        if isinstance(exc, anthropic.AuthenticationError):
+            status_code = 401
+        elif isinstance(exc, anthropic.RateLimitError):
+            status_code = 429
+        elif isinstance(exc, anthropic.APIStatusError):
+            status_code = exc.status_code
+    except ImportError:
+        pass
+
+    if status_code:
+        container.model_router.report_key_error(session_key, status_code)
+
+    logger.error(
+        "llm_api_error",
+        error_type=exc_type,
+        status_code=status_code,
+        session_key=session_key,
     )
 
 
@@ -230,13 +336,9 @@ async def _call_anthropic_stream(
 
             if event_type == "content_block_start":
                 block = event.content_block
-                if block.type == "text":
-                    pass
-                elif block.type == "tool_use":
+                if block.type == "tool_use":
                     current_tool = {"id": block.id, "name": block.name, "input": {}}
                     current_tool_json = ""
-                elif block.type == "thinking":
-                    pass
 
             elif event_type == "content_block_delta":
                 delta = event.delta

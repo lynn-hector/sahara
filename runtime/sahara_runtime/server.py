@@ -51,6 +51,13 @@ async def serve() -> None:
     agent_servicer = AgentServicer(container)
     agent_pb2_grpc.add_AgentServiceServicer_to_server(agent_servicer, server)
 
+    # Register WorkerService
+    from sahara.worker.v1 import worker_pb2_grpc
+    from sahara_runtime.grpc.worker_servicer import WorkerServicer
+
+    worker_servicer = WorkerServicer(container, agent_servicer)
+    worker_pb2_grpc.add_WorkerServiceServicer_to_server(worker_servicer, server)
+
     # gRPC Health Check (standard protocol)
     from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 

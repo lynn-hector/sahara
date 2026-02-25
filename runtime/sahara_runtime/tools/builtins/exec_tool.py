@@ -60,4 +60,5 @@ EXEC_TOOL = ToolDef(
     },
     func=exec_command,
     tier=0,
+    sandboxed=True,
 )

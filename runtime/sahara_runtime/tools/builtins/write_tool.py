@@ -48,4 +48,5 @@ WRITE_TOOL = ToolDef(
     },
     func=write_file,
     tier=0,
+    sandboxed=True,
 )

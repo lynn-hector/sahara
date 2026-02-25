@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import grpc
@@ -45,24 +45,34 @@ class AgentServicer(agent_pb2_grpc.AgentServiceServicer):
 
     def __init__(self, container: Container) -> None:
         self._container = container
-        self._semaphore = asyncio.Semaphore(container.settings.max_concurrent_tasks)
+        self._max_tasks = container.settings.max_concurrent_tasks
         self._tasks: dict[str, TaskHandle] = {}
 
     @property
     def active_count(self) -> int:
         return len(self._tasks)
 
+    @property
+    def available_slots(self) -> int:
+        return max(0, self._max_tasks - len(self._tasks))
+
     async def SubmitTask(
         self,
         request: agent_pb2.SubmitTaskRequest,
         context: grpc.aio.ServicerContext,
     ) -> agent_pb2.SubmitTaskResponse:
-        if not self._semaphore._value:
+        if self.available_slots <= 0:
             await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "worker is busy")
 
         task_id = request.task_id or str(uuid.uuid4())
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         session_key = request.session_key
+
+        user_text = ""
+        if request.HasField("user_message"):
+            user_text = request.user_message.text
+        if not user_text:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "user_message.text is required")
 
         logger.info(
             "submit_task",
@@ -78,7 +88,7 @@ class AgentServicer(agent_pb2_grpc.AgentServiceServicer):
             task_id=task_id,
             run_id=run_id,
             session_key=session_key,
-            user_message=request.user_message.text,
+            user_message=user_text,
             agent_id=request.agent_id,
             metadata=dict(request.metadata),
             container=self._container,
@@ -168,7 +178,6 @@ class AgentServicer(agent_pb2_grpc.AgentServiceServicer):
         request: agent_pb2.SendInputRequest,
         context: grpc.aio.ServicerContext,
     ) -> agent_pb2.SendInputResponse:
-        # Phase 2: human-in-the-loop
         await context.abort(grpc.StatusCode.UNIMPLEMENTED, "SendInput not implemented in Phase 1")
 
     def _on_task_done(self, task_id: str) -> None:
