@@ -8,9 +8,15 @@ gRPC Server 入口 — Sahara Runtime Worker
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
 from concurrent import futures
+
+# Ensure generated protobuf code is importable
+_gen_path = os.path.join(os.path.dirname(__file__), "..", "gen")
+if os.path.isdir(_gen_path) and _gen_path not in sys.path:
+    sys.path.insert(0, os.path.abspath(_gen_path))
 
 import grpc
 import structlog
@@ -25,28 +31,27 @@ async def serve() -> None:
     """启动 gRPC server."""
     settings = Settings()
 
-    # 初始化依赖容器
     container = Container(settings)
     await container.startup()
 
-    # 创建 gRPC server
     server = grpc.aio.server(
         futures.ThreadPoolExecutor(max_workers=4),
         options=[
-            ("grpc.max_send_message_length", 50 * 1024 * 1024),  # 50MB
+            ("grpc.max_send_message_length", 50 * 1024 * 1024),
             ("grpc.max_receive_message_length", 50 * 1024 * 1024),
             ("grpc.keepalive_time_ms", 30_000),
             ("grpc.keepalive_timeout_ms", 10_000),
         ],
     )
 
-    # TODO Phase 1: 注册 AgentService 和 WorkerService
-    # from sahara_runtime.services.agent import AgentServicer
-    # from sahara_runtime.services.worker import WorkerServicer
-    # agent_pb2_grpc.add_AgentServiceServicer_to_server(AgentServicer(container), server)
-    # worker_pb2_grpc.add_WorkerServiceServicer_to_server(WorkerServicer(container), server)
+    # Register AgentService
+    from sahara.agent.v1 import agent_pb2_grpc
+    from sahara_runtime.grpc.agent_servicer import AgentServicer
 
-    # 启用 gRPC Health Check (标准协议)
+    agent_servicer = AgentServicer(container)
+    agent_pb2_grpc.add_AgentServiceServicer_to_server(agent_servicer, server)
+
+    # gRPC Health Check (standard protocol)
     from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
     health_servicer = health.HealthServicer()
@@ -72,7 +77,7 @@ async def serve() -> None:
 
     await server.start()
 
-    # 优雅关闭
+    # Graceful shutdown
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 

@@ -1,5 +1,1 @@
-"""
-事件发射器 — Runtime → Redis Streams
-
-参考: D4 §5 EventEmitter
-"""
+"""事件发射系统 — Runtime → Redis Streams → Gateway"""

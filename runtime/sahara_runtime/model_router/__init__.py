@@ -1,5 +1,1 @@
-"""
-模型管理 — Provider Adapter + API Key 轮换 + Fallback
-
-参考: D4 §6 Model Router
-"""
+"""模型路由 — Provider 适配、Key 池、Session 亲和"""
