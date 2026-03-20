@@ -149,7 +149,11 @@ class TestToolRegistry:
         reg.register(ToolDef(name="a", description="A", input_schema={"a": 1}, func=echo_tool, tier=0))
         schemas = reg.list_schemas()
         assert len(schemas) == 2
-        assert schemas[0]["name"] == "a"  # tier 0 first
+        assert schemas[0]["type"] == "function"
+        assert schemas[0]["function"]["name"] == "a"  # tier 0 first
+        assert schemas[0]["function"]["parameters"] == {"a": 1}
+        assert schemas[1]["function"]["name"] == "b"
+        assert schemas[1]["function"]["parameters"] == {"b": 1}
 
     def test_names(self):
         reg = ToolRegistry()

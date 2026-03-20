@@ -1,13 +1,18 @@
-"""
-Dependencies 注入容器 — 管理所有 Runtime 子系统实例
+"""Dependencies 注入容器 — 管理所有 Runtime 子系统实例
 
 参考: D4 §14 Dependencies 启动流程
+
+重构改进:
+- llm_client 替换为 llm_provider (LLMProvider ABC)
+- 新增 tool_executor 实例（复用而非每次任务新建）
+- LLM Provider 根据配置自动选择 Anthropic / Mock
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import structlog
 
@@ -20,12 +25,14 @@ if TYPE_CHECKING:
     from sahara_runtime.events.backend import EventBackend
     from sahara_runtime.events.emitter import EventEmitterFactory
     from sahara_runtime.hooks.runner import HookRunner
+    from sahara_runtime.llm.base import LLMProvider
     from sahara_runtime.memory.session_store import SessionStore
     from sahara_runtime.model_router.router import ModelRouter
     from sahara_runtime.prompt.builder import PromptBuilder
     from sahara_runtime.sandbox.base import SandboxManager
     from sahara_runtime.skills.filter import SkillFilter
     from sahara_runtime.skills.loader import SkillLoader
+    from sahara_runtime.tools.executor import ToolExecutor
     from sahara_runtime.tools.registry import ToolRegistry
 
 logger = structlog.get_logger(__name__)
@@ -43,11 +50,12 @@ class Container:
     emitter_factory: EventEmitterFactory | None = None
 
     # ── LLM / Model ──────────────────────────────────
-    llm_client: Any | None = None
+    llm_provider: LLMProvider | None = None
     model_router: ModelRouter | None = None
 
     # ── Tools & Prompt ────────────────────────────────
     tool_registry: ToolRegistry | None = None
+    tool_executor: ToolExecutor | None = None
     prompt_builder: PromptBuilder | None = None
 
     # ── Session & Context ─────────────────────────────
@@ -55,7 +63,8 @@ class Container:
     token_counter: TokenCounter | None = None
     context_manager: ContextManager | None = None
 
-    # ── Sandbox ───────────────────────────────────────
+    # ── Workspace & Sandbox ──────────────────────────
+    workspace: Path | None = None
     sandbox_manager: SandboxManager | None = None
 
     # ── Skills ────────────────────────────────────────
@@ -72,6 +81,11 @@ class Container:
             worker_id=self.settings.worker_id,
             max_tasks=self.settings.max_concurrent_tasks,
         )
+
+        # 0. Workspace
+        from sahara_runtime.tools.workspace import ensure_workspace
+
+        self.workspace = ensure_workspace(self.settings.workspace_dir)
 
         # 1. Redis
         from redis.asyncio import Redis as AsyncRedis
@@ -111,21 +125,8 @@ class Container:
 
         self.model_router = ModelRouter(self.settings)
 
-        # 6. LLM Client (if API key available)
-        if self.settings.anthropic_api_key:
-            try:
-                import anthropic
-
-                self.llm_client = anthropic.AsyncAnthropic(
-                    api_key=self.settings.anthropic_api_key.split(",")[0].strip()
-                )
-                logger.info("anthropic client initialized")
-            except ImportError:
-                logger.warning("anthropic package not installed, using mock LLM")
-            except Exception:
-                logger.exception("failed to init anthropic client, using mock LLM")
-        else:
-            logger.info("no anthropic API key, using mock LLM")
+        # 6. LLM Provider (Anthropic → Mock fallback)
+        self.llm_provider = self._create_llm_provider()
 
         # 7. Sandbox Manager — provider: "noop" | "docker" | "e2b"
         self.sandbox_manager = await self._create_sandbox_manager()
@@ -137,10 +138,20 @@ class Container:
         from sahara_runtime.tools.registry import ToolRegistry
 
         self.tool_registry = ToolRegistry()
-        register_builtins(self.tool_registry)
+        register_builtins(self.tool_registry, workspace=self.workspace)
         logger.info("tools registered", tools=self.tool_registry.names())
 
-        # 9. Skill Loader + Filter
+        # 9. Tool Executor (复用实例)
+        # sandbox_enabled=false 时不传 sandbox_manager，让 executor 直接调用工具函数
+        # （工具函数自带完善的路径检查和错误处理，优于 NoopSandbox 的简单透传）
+        from sahara_runtime.tools.executor import ToolExecutor
+
+        real_sandbox = self.sandbox_manager if self.settings.sandbox_enabled else None
+        self.tool_executor = ToolExecutor(
+            self.tool_registry, sandbox_manager=real_sandbox,
+        )
+
+        # 10. Skill Loader + Filter
         from sahara_runtime.skills.filter import SkillFilter
         from sahara_runtime.skills.loader import SkillLoader
 
@@ -151,30 +162,94 @@ class Container:
         )
         disabled = set()
         if self.settings.disabled_skills:
-            disabled = {s.strip() for s in self.settings.disabled_skills.split(",") if s.strip()}
+            disabled = {
+                s.strip()
+                for s in self.settings.disabled_skills.split(",")
+                if s.strip()
+            }
         self.skill_filter = SkillFilter(disabled_skills=disabled)
         logger.info("skill_loader initialized")
 
-        # 10. Hook Runner + Builtin Hooks
+        # 11. Hook Runner + Builtin Hooks
         from sahara_runtime.hooks.builtins import register_builtin_hooks
         from sahara_runtime.hooks.runner import HookRunner
 
         self.hook_runner = HookRunner()
         register_builtin_hooks(self.hook_runner)
-        logger.info("hook_runner initialized", hooks=len(self.hook_runner.list_hooks()))
+        logger.info(
+            "hook_runner initialized", hooks=len(self.hook_runner.list_hooks()),
+        )
 
-        # 11. Prompt Builder
+        # 12. Prompt Builder
         from sahara_runtime.prompt.builder import PromptBuilder
 
         self.prompt_builder = PromptBuilder()
 
         logger.info("container started")
 
+    def _create_llm_provider(self) -> LLMProvider:
+        """根据配置选择 LLM Provider。
+
+        settings.llm_provider:
+        - "litellm"    → LiteLLMProvider (默认，支持 100+ 模型)
+        - "anthropic"  → AnthropicProvider (Anthropic SDK 直连)
+        - "deepseek"   → DeepSeekProvider (DeepSeek SDK 直连)
+        - "mock"       → MockProvider (开发/测试降级)
+        """
+        provider_type = self.settings.llm_provider
+
+        if provider_type == "litellm":
+            try:
+                from sahara_runtime.llm.litellm_provider import LiteLLMProvider
+                logger.info("llm_provider initialized", provider="litellm")
+                return LiteLLMProvider()
+            except ImportError:
+                logger.warning(
+                    "litellm package not installed, falling back to anthropic provider",
+                )
+                provider_type = "anthropic"
+
+        if provider_type == "deepseek":
+            if self.settings.deepseek_api_key:
+                from sahara_runtime.llm.deepseek_provider import DeepSeekProvider
+                logger.info("llm_provider initialized", provider="deepseek")
+                return DeepSeekProvider()
+            logger.warning(
+                "deepseek_api_key not set, falling back to mock provider",
+            )
+
+        if provider_type == "anthropic":
+            if self.settings.anthropic_api_key:
+                try:
+                    from sahara_runtime.llm.anthropic_provider import AnthropicProvider
+                    logger.info("llm_provider initialized", provider="anthropic")
+                    return AnthropicProvider()
+                except ImportError:
+                    logger.warning(
+                        "anthropic package not installed, using mock LLM provider",
+                    )
+                except Exception:
+                    logger.exception(
+                        "failed to init anthropic provider, using mock LLM provider",
+                    )
+            else:
+                logger.warning(
+                    "anthropic_api_key not set, falling back to mock provider",
+                )
+
+        from sahara_runtime.llm.mock_provider import MockProvider
+        logger.info("llm_provider initialized", provider="mock")
+        return MockProvider()
+
     async def _create_sandbox_manager(self) -> SandboxManager:
         """根据 sandbox_provider 配置创建对应的 SandboxManager。"""
         from sahara_runtime.sandbox.noop_sandbox import NoopSandboxManager
 
-        provider = self.settings.sandbox_provider if self.settings.sandbox_enabled else "noop"
+        provider = (
+            self.settings.sandbox_provider
+            if self.settings.sandbox_enabled
+            else "noop"
+        )
 
         if provider == "e2b":
             if not self.settings.e2b_api_key:
@@ -190,7 +265,9 @@ class Container:
                     pool_size=self.settings.sandbox_pool_size,
                 )
             except ImportError:
-                logger.warning("e2b package not installed, falling back to noop sandbox")
+                logger.warning(
+                    "e2b package not installed, falling back to noop sandbox",
+                )
                 return NoopSandboxManager()
 
         if provider == "docker":
@@ -202,7 +279,9 @@ class Container:
                     pool_size=self.settings.sandbox_pool_size,
                 )
             except Exception:
-                logger.warning("docker sandbox unavailable, falling back to noop sandbox")
+                logger.warning(
+                    "docker sandbox unavailable, falling back to noop sandbox",
+                )
                 return NoopSandboxManager()
 
         return NoopSandboxManager()

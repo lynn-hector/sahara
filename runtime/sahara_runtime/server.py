@@ -19,6 +19,7 @@ if os.path.isdir(_gen_path) and _gen_path not in sys.path:
     sys.path.insert(0, os.path.abspath(_gen_path))
 
 import grpc
+import grpc.aio
 import structlog
 
 from sahara_runtime.config.settings import Settings
@@ -46,6 +47,7 @@ async def serve() -> None:
 
     # Register AgentService
     from sahara.agent.v1 import agent_pb2_grpc
+
     from sahara_runtime.grpc.agent_servicer import AgentServicer
 
     agent_servicer = AgentServicer(container)
@@ -53,6 +55,7 @@ async def serve() -> None:
 
     # Register WorkerService
     from sahara.worker.v1 import worker_pb2_grpc
+
     from sahara_runtime.grpc.worker_servicer import WorkerServicer
 
     worker_servicer = WorkerServicer(container, agent_servicer)
@@ -114,7 +117,7 @@ async def _start_metrics_server(port: int) -> asyncio.Server | None:
     if port <= 0:
         return None
     try:
-        from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+        from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
         async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             await reader.readline()

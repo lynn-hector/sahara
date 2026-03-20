@@ -1,8 +1,7 @@
 """Fallback 逻辑单元测试 — _is_retryable / _extract_status_code。"""
 
-import pytest
 
-from sahara_runtime.agent_loop import _extract_status_code, _is_retryable
+from sahara_runtime.llm.base import _extract_status_code, _is_retryable
 
 
 class TestIsRetryable:

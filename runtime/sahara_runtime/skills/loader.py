@@ -84,7 +84,7 @@ class SkillLoader:
                 continue
 
             try:
-                with open(skill_md, "r", encoding="utf-8") as f:
+                with open(skill_md, encoding="utf-8") as f:
                     raw = f.read()
 
                 frontmatter, _body = self._parse_frontmatter(raw)

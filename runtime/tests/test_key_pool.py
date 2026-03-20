@@ -1,10 +1,9 @@
 """KeyPool 单元测试。"""
 
-import time
 
 import pytest
 
-from sahara_runtime.model_router.key_pool import CIRCUIT_BREAK_DURATION, KeyPool, KeyState
+from sahara_runtime.model_router.key_pool import KeyPool
 
 
 @pytest.fixture

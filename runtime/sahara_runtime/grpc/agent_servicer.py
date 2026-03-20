@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 
 import grpc
 import structlog
-
 from sahara.agent.v1 import agent_pb2, agent_pb2_grpc
 from sahara.common.v1 import common_pb2
 
@@ -88,7 +87,7 @@ class AgentServicer(agent_pb2_grpc.AgentServiceServicer):
             return 0
         try:
             await asyncio.wait_for(self._drain_event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
         return len(self._tasks)
 

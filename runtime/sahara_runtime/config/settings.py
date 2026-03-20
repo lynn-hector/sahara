@@ -31,9 +31,20 @@ class Settings(BaseSettings):
     postgres_dsn: str = "postgresql://sahara:sahara_dev@localhost:5432/sahara"
 
     # ── LLM ─────────────────────────────────────────────
+    llm_provider: str = "litellm"  # "litellm" | "anthropic" | "deepseek" | "mock"
     anthropic_api_key: str = ""
     openai_api_key: str = ""
+    deepseek_api_key: str = ""
     default_model: str = "claude-sonnet-4-20250514"
+    litellm_api_base: str = ""  # custom LiteLLM endpoint
+    deepseek_api_base: str = ""  # custom DeepSeek endpoint
+
+    # ── Workspace ─────────────────────────────────────────
+    # 默认在 runtime 项目根目录下的 workspace/
+    workspace_dir: str = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "workspace",
+    )
 
     # ── Agent Loop ──────────────────────────────────────
     max_iterations: int = 20

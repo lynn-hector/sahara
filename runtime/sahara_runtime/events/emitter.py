@@ -6,8 +6,8 @@ import time
 
 import structlog
 import ulid
-
 from sahara.event.v1 import event_pb2
+
 from sahara_runtime.events.backend import EventBackend
 
 logger = structlog.get_logger(__name__)

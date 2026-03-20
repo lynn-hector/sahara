@@ -45,13 +45,13 @@ async def sync_skills_to_sandbox(
             skill_dir = f"{SANDBOX_SKILLS_DIR}/{entry.name}"
             await sandbox.exec(f"mkdir -p {skill_dir}")
 
-            with open(entry.file_path, "r", encoding="utf-8") as f:
+            with open(entry.file_path, encoding="utf-8") as f:
                 content = f.read()
             await sandbox.write_file(f"{skill_dir}/SKILL.md", content)
 
             for extra_file in _list_extra_files(entry.base_dir):
                 rel_path = os.path.relpath(extra_file, entry.base_dir)
-                with open(extra_file, "r", encoding="utf-8") as f:
+                with open(extra_file, encoding="utf-8") as f:
                     extra_content = f.read()
                 await sandbox.write_file(f"{skill_dir}/{rel_path}", extra_content)
 

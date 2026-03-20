@@ -58,6 +58,7 @@ class PromptBuilder:
         max_iterations: int,
         tools: list[dict] | None = None,
         skills_prompt: str = "",
+        workspace_path: str = "",
     ) -> str:
         segments: list[PromptSegment] = [
             PromptSegment(name="identity", content=IDENTITY_SEGMENT, priority=0),
@@ -65,7 +66,9 @@ class PromptBuilder:
         ]
 
         if tools:
-            tool_names = [t.get("name", "unknown") for t in tools]
+            tool_names = [
+                t.get("function", {}).get("name", "unknown") for t in tools
+            ]
             tool_guide = (
                 "You have access to the following tools:\n"
                 + "\n".join(f"- {name}" for name in tool_names)
@@ -74,8 +77,18 @@ class PromptBuilder:
             )
             segments.append(PromptSegment(name="tools", content=tool_guide, priority=2))
 
+        if workspace_path:
+            ws_guide = (
+                f"Workspace:\n"
+                f"Your workspace directory is: {workspace_path}\n"
+                f"- Use relative paths (e.g. \"hello.py\") to read/write files in workspace\n"
+                f"- Use absolute paths only for system files outside workspace\n"
+                f"- Shell commands (exec) run with workspace as the working directory"
+            )
+            segments.append(PromptSegment(name="workspace", content=ws_guide, priority=3))
+
         if skills_prompt:
-            segments.append(PromptSegment(name="skills", content=skills_prompt, priority=3))
+            segments.append(PromptSegment(name="skills", content=skills_prompt, priority=4))
 
         runtime_info = RUNTIME_SEGMENT_TEMPLATE.format(
             session_key=session_key,

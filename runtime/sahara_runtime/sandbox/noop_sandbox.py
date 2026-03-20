@@ -36,11 +36,22 @@ class NoopSandbox(Sandbox):
         return output, proc.returncode or 0
 
     async def read_file(self, path: str) -> str:
+        path = os.path.expanduser(path)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"No such file or directory: '{path}'")
+        if os.path.isdir(path):
+            entries = os.listdir(path)
+            return f"Directory listing ({len(entries)} entries):\n" + "\n".join(
+                entries[:200]
+            )
         with open(path, encoding="utf-8", errors="replace") as f:
             return f.read()
 
     async def write_file(self, path: str, content: str) -> None:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        path = os.path.expanduser(path)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
 

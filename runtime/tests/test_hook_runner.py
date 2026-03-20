@@ -4,8 +4,8 @@ import asyncio
 
 import pytest
 
-from sahara_runtime.hooks.runner import HookContext, HookName, HookRegistration, HookRunner
 from sahara_runtime.hooks.builtins import register_builtin_hooks
+from sahara_runtime.hooks.runner import HookContext, HookName, HookRegistration, HookRunner
 
 
 @pytest.fixture

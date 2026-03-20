@@ -13,6 +13,7 @@ dependencies = [
     # LLM SDK
     "anthropic>=0.40.0",
     "openai>=1.57.0",
+    "litellm>=1.55.0",
 
     # 异步
     "uvloop>=0.21.0",

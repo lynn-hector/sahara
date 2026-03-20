@@ -13,12 +13,11 @@ from typing import TYPE_CHECKING
 
 import grpc
 import structlog
-
 from sahara.worker.v1 import worker_pb2, worker_pb2_grpc
 
 if TYPE_CHECKING:
-    from sahara_runtime.grpc.agent_servicer import AgentServicer
     from sahara_runtime.di.container import Container
+    from sahara_runtime.grpc.agent_servicer import AgentServicer
 
 logger = structlog.get_logger(__name__)
 
