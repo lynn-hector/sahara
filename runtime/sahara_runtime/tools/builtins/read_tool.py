@@ -1,70 +1,106 @@
-"""read 工具 — 读取文件内容，路径基于 workspace 解析。"""
+"""read_file 工具 — 读取文件内容，支持分页。
+
+参考 nanobot/agent/tools/filesystem.py ReadFileTool。
+"""
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
+from typing import Any
 
-from sahara_runtime.tools.workspace import resolve_path
+from sahara_runtime.tools.builtins.fs_base import FsTool
 
-MAX_FILE_SIZE = 100_000  # 100KB
-
-INPUT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "path": {
-            "type": "string",
-            "description": "File path. Relative paths resolve from workspace.",
-        },
-        "offset": {
-            "type": "integer",
-            "description": "Line number to start reading from (0-based, default: 0)",
-            "default": 0,
-        },
-        "limit": {
-            "type": "integer",
-            "description": "Maximum number of lines to read (0 = all, default: 0)",
-            "default": 0,
-        },
-    },
-    "required": ["path"],
-}
+_MAX_CHARS = 128_000
+_DEFAULT_LIMIT = 2000
 
 
-async def read_file(
-    path: str,
-    offset: int = 0,
-    limit: int = 0,
-    *,
-    workspace: Path,
-) -> str:
-    """读取文件内容，支持偏移和行数限制。"""
-    resolved = str(resolve_path(path, workspace))
+class ReadFileTool(FsTool):
+    """读取文件内容，返回带行号的文本。"""
 
-    if not os.path.exists(resolved):
-        return f"Error: file not found: {resolved}"
+    @property
+    def name(self) -> str:
+        return "read_file"
 
-    if os.path.isdir(resolved):
-        entries = os.listdir(resolved)
-        return f"Directory listing ({len(entries)} entries):\n" + "\n".join(
-            entries[:200]
+    @property
+    def description(self) -> str:
+        return (
+            "Read the contents of a file. Returns numbered lines. "
+            "Use offset and limit to paginate through large files."
         )
 
-    size = os.path.getsize(resolved)
-    if size > MAX_FILE_SIZE:
-        return f"Error: file too large ({size} bytes, max {MAX_FILE_SIZE})"
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path. Relative paths resolve from workspace.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Line number to start reading from (1-indexed, default 1)",
+                    "minimum": 1,
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": f"Maximum lines to read (default {_DEFAULT_LIMIT})",
+                    "minimum": 1,
+                },
+            },
+            "required": ["path"],
+        }
 
-    with open(resolved, encoding="utf-8", errors="replace") as f:
-        lines = f.readlines()
+    async def execute(
+        self,
+        path: str,
+        offset: int = 1,
+        limit: int | None = None,
+        **kwargs: Any,
+    ) -> str:
+        try:
+            fp = self._resolve(path)
+        except PermissionError as e:
+            return f"Error: {e}"
 
-    if offset > 0:
-        lines = lines[offset:]
-    if limit > 0:
-        lines = lines[:limit]
+        if not fp.exists():
+            return f"Error: File not found: {path}"
+        if not fp.is_file():
+            return f"Error: Not a file: {path}"
 
-    numbered = []
-    start = max(offset, 0) + 1
-    for i, line in enumerate(lines):
-        numbered.append(f"{start + i:6d}|{line.rstrip()}")
+        try:
+            all_lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception as e:
+            return f"Error reading file: {e}"
 
-    return "\n".join(numbered)
+        total = len(all_lines)
+        if total == 0:
+            return f"(Empty file: {path})"
+        if offset < 1:
+            offset = 1
+        if offset > total:
+            return f"Error: offset {offset} is beyond end of file ({total} lines)"
+
+        start = offset - 1
+        end = min(start + (limit or _DEFAULT_LIMIT), total)
+        numbered = [f"{start + i + 1}| {line}" for i, line in enumerate(all_lines[start:end])]
+        result = "\n".join(numbered)
+
+        if len(result) > _MAX_CHARS:
+            trimmed: list[str] = []
+            chars = 0
+            for line in numbered:
+                chars += len(line) + 1
+                if chars > _MAX_CHARS:
+                    break
+                trimmed.append(line)
+            end = start + len(trimmed)
+            result = "\n".join(trimmed)
+
+        if end < total:
+            result += (
+                f"\n\n(Showing lines {offset}-{end} of {total}. "
+                f"Use offset={end + 1} to continue.)"
+            )
+        else:
+            result += f"\n\n(End of file — {total} lines total)"
+        return result

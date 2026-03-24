@@ -1,1 +1,1 @@
-"""工具系统 — ToolRegistry + ToolExecutor + 内置工具"""
+"""工具系统 — Tool ABC + ToolRegistry + ToolExecutor + 内置工具"""

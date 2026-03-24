@@ -26,14 +26,31 @@ HookCallback = Callable[..., Coroutine[Any, Any, Any]]
 class HookName(str, enum.Enum):
     """预定义的 Hook 点。"""
 
-    PRE_LLM_CALL = "pre_llm_call"
-    POST_LLM_CALL = "post_llm_call"
-    PRE_TOOL_EXEC = "pre_tool_exec"
-    POST_TOOL_EXEC = "post_tool_exec"
+    # ── Run 生命周期 ──────────────────────────────────
     ON_RUN_START = "on_run_start"
     ON_RUN_COMPLETE = "on_run_complete"
     ON_RUN_ERROR = "on_run_error"
-    ON_CONTEXT_OVERFLOW = "on_context_overflow"
+    ON_RUN_ABORT = "on_run_abort"
+
+    # ── LLM 调用 ─────────────────────────────────────
+    PRE_LLM_CALL = "pre_llm_call"
+    POST_LLM_CALL = "post_llm_call"
+
+    # ── 工具执行 ─────────────────────────────────────
+    PRE_TOOL_EXEC = "pre_tool_exec"
+    POST_TOOL_EXEC = "post_tool_exec"
+    POST_TOOL_EXEC_FAILURE = "post_tool_exec_failure"
+
+    # ── 上下文管理 ───────────────────────────────────
+    PRE_CONTEXT_TRIM = "pre_context_trim"
+    POST_CONTEXT_TRIM = "post_context_trim"
+
+    # ── 响应输出 ─────────────────────────────────────
+    PRE_RESPONSE = "pre_response"
+
+    # ── 会话级别 ─────────────────────────────────────
+    ON_SESSION_START = "on_session_start"
+    ON_SESSION_END = "on_session_end"
 
 
 @dataclass

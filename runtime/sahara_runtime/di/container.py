@@ -20,18 +20,15 @@ if TYPE_CHECKING:
     from redis.asyncio import Redis
 
     from sahara_runtime.config.settings import Settings
-    from sahara_runtime.context.manager import ContextManager
-    from sahara_runtime.context.token_counter import TokenCounter
+    from sahara_runtime.context.context_manager import ContextManager
     from sahara_runtime.events.backend import EventBackend
     from sahara_runtime.events.emitter import EventEmitterFactory
     from sahara_runtime.hooks.runner import HookRunner
     from sahara_runtime.llm.base import LLMProvider
     from sahara_runtime.memory.session_store import SessionStore
     from sahara_runtime.model_router.router import ModelRouter
-    from sahara_runtime.prompt.builder import PromptBuilder
     from sahara_runtime.sandbox.base import SandboxManager
-    from sahara_runtime.skills.filter import SkillFilter
-    from sahara_runtime.skills.loader import SkillLoader
+    from sahara_runtime.skills.manager import SkillsManager
     from sahara_runtime.tools.executor import ToolExecutor
     from sahara_runtime.tools.registry import ToolRegistry
 
@@ -53,23 +50,20 @@ class Container:
     llm_provider: LLMProvider | None = None
     model_router: ModelRouter | None = None
 
-    # ── Tools & Prompt ────────────────────────────────
+    # ── Tools ─────────────────────────────────────────
     tool_registry: ToolRegistry | None = None
     tool_executor: ToolExecutor | None = None
-    prompt_builder: PromptBuilder | None = None
 
-    # ── Session & Context ─────────────────────────────
-    session_store: SessionStore | None = None
-    token_counter: TokenCounter | None = None
+    # ── Context & Session ────────────────────────────
     context_manager: ContextManager | None = None
+    session_store: SessionStore | None = None
 
     # ── Workspace & Sandbox ──────────────────────────
     workspace: Path | None = None
     sandbox_manager: SandboxManager | None = None
 
     # ── Skills ────────────────────────────────────────
-    skill_loader: SkillLoader | None = None
-    skill_filter: SkillFilter | None = None
+    skills_manager: SkillsManager | None = None
 
     # ── Hooks ─────────────────────────────────────────
     hook_runner: HookRunner | None = None
@@ -82,12 +76,26 @@ class Container:
             max_tasks=self.settings.max_concurrent_tasks,
         )
 
-        # 0. Workspace
+        self._init_workspace()
+        await self._init_redis()
+        self._init_events()
+        self._init_session_store()
+        self._init_model_router()
+        self._init_llm_provider()
+        await self._init_sandbox()
+        self._init_tools()
+        self._init_skills()
+        self._init_context()
+        self._init_hooks()
+
+        logger.info("container started")
+
+    def _init_workspace(self) -> None:
         from sahara_runtime.tools.workspace import ensure_workspace
 
         self.workspace = ensure_workspace(self.settings.workspace_dir)
 
-        # 1. Redis
+    async def _init_redis(self) -> None:
         from redis.asyncio import Redis as AsyncRedis
 
         self.redis = AsyncRedis.from_url(
@@ -97,7 +105,7 @@ class Container:
         await self.redis.ping()
         logger.info("redis connected", url=self.settings.redis_url)
 
-        # 2. Event Backend + Factory
+    def _init_events(self) -> None:
         from sahara_runtime.events.emitter import EventEmitterFactory
         from sahara_runtime.events.redis_backend import RedisStreamsBackend
 
@@ -107,85 +115,85 @@ class Container:
             self.settings.worker_id,
         )
 
-        # 3. Session Store
+    def _init_session_store(self) -> None:
         from sahara_runtime.memory.session_store import SessionStore
 
         self.session_store = SessionStore(self.redis)
         logger.info("session_store initialized")
 
-        # 4. Context Manager
-        from sahara_runtime.context.manager import ContextManager
-        from sahara_runtime.context.token_counter import TokenCounter
-
-        self.token_counter = TokenCounter()
-        self.context_manager = ContextManager(self.token_counter)
-
-        # 5. Model Router
+    def _init_model_router(self) -> None:
         from sahara_runtime.model_router.router import ModelRouter
 
         self.model_router = ModelRouter(self.settings)
 
-        # 6. LLM Provider (Anthropic → Mock fallback)
+    def _init_llm_provider(self) -> None:
         self.llm_provider = self._create_llm_provider()
 
-        # 7. Sandbox Manager — provider: "noop" | "docker" | "e2b"
+    async def _init_sandbox(self) -> None:
         self.sandbox_manager = await self._create_sandbox_manager()
         await self.sandbox_manager.startup()
         logger.info("sandbox manager started", provider=self.settings.sandbox_provider)
 
-        # 8. Tool Registry + Builtins
+    def _init_tools(self) -> None:
         from sahara_runtime.tools.builtins import register_builtins
+        from sahara_runtime.tools.executor import ToolExecutor
         from sahara_runtime.tools.registry import ToolRegistry
 
         self.tool_registry = ToolRegistry()
         register_builtins(self.tool_registry, workspace=self.workspace)
         logger.info("tools registered", tools=self.tool_registry.names())
 
-        # 9. Tool Executor (复用实例)
-        # sandbox_enabled=false 时不传 sandbox_manager，让 executor 直接调用工具函数
-        # （工具函数自带完善的路径检查和错误处理，优于 NoopSandbox 的简单透传）
-        from sahara_runtime.tools.executor import ToolExecutor
-
         real_sandbox = self.sandbox_manager if self.settings.sandbox_enabled else None
         self.tool_executor = ToolExecutor(
-            self.tool_registry, sandbox_manager=real_sandbox,
+            self.tool_registry,
+            sandbox_manager=real_sandbox,
         )
 
-        # 10. Skill Loader + Filter
+    def _init_skills(self) -> None:
         from sahara_runtime.skills.filter import SkillFilter
         from sahara_runtime.skills.loader import SkillLoader
+        from sahara_runtime.skills.manager import SkillsManager
 
-        self.skill_loader = SkillLoader(
+        skill_loader = SkillLoader(
             bundled_dir=self.settings.bundled_skills_dir,
             configured_dir=self.settings.configured_skills_dir,
             managed_dir=self.settings.managed_skills_dir,
         )
-        disabled = set()
-        if self.settings.disabled_skills:
-            disabled = {
-                s.strip()
-                for s in self.settings.disabled_skills.split(",")
-                if s.strip()
-            }
-        self.skill_filter = SkillFilter(disabled_skills=disabled)
-        logger.info("skill_loader initialized")
+        skill_filter = SkillFilter(disabled_skills=self._build_disabled_skills())
+        self.skills_manager = SkillsManager(
+            loader=skill_loader,
+            skill_filter=skill_filter,
+        )
+        logger.info("skills initialized")
 
-        # 11. Hook Runner + Builtin Hooks
+    def _init_context(self) -> None:
+        from sahara_runtime.context.context_manager import ContextManager
+
+        self.context_manager = ContextManager(
+            workspace=self.workspace,
+            skills_manager=self.skills_manager,
+            tool_registry=self.tool_registry,
+        )
+
+    def _init_hooks(self) -> None:
         from sahara_runtime.hooks.builtins import register_builtin_hooks
         from sahara_runtime.hooks.runner import HookRunner
 
         self.hook_runner = HookRunner()
         register_builtin_hooks(self.hook_runner)
         logger.info(
-            "hook_runner initialized", hooks=len(self.hook_runner.list_hooks()),
+            "hook_runner initialized",
+            hooks=len(self.hook_runner.list_hooks()),
         )
 
-        # 12. Prompt Builder
-        from sahara_runtime.prompt.builder import PromptBuilder
-
-        self.prompt_builder = PromptBuilder()
-
-        logger.info("container started")
+    def _build_disabled_skills(self) -> set[str]:
+        if not self.settings.disabled_skills:
+            return set()
+        return {
+            name.strip()
+            for name in self.settings.disabled_skills.split(",")
+            if name.strip()
+        }
 
     def _create_llm_provider(self) -> LLMProvider:
         """根据配置选择 LLM Provider。

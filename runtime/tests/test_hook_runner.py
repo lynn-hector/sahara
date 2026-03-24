@@ -91,7 +91,7 @@ class TestHookRunner:
         assert len(runner.list_hooks(HookName.ON_RUN_START)) == 1
 
     def test_empty_hook_returns_ctx(self, runner):
-        ctx = HookContext(hook_name=HookName.ON_CONTEXT_OVERFLOW, data={"key": "val"})
+        ctx = HookContext(hook_name=HookName.POST_CONTEXT_TRIM, data={"key": "val"})
         result = asyncio.get_event_loop().run_until_complete(runner.run(ctx))
         assert result.data == {"key": "val"}
 
@@ -112,7 +112,7 @@ class TestBuiltinHooks:
         runner = HookRunner()
         register_builtin_hooks(runner)
         all_hooks = runner.list_hooks()
-        assert len(all_hooks) == 7
+        assert len(all_hooks) == 13
 
     def test_safety_blocks_dangerous_command(self):
         runner = HookRunner()

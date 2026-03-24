@@ -58,12 +58,28 @@ async def _metrics_hook(ctx: HookContext) -> HookContext:
 
         elif ctx.hook_name == HookName.POST_TOOL_EXEC:
             tool_name = ctx.data.get("tool_name", "unknown")
-            success = str(ctx.data.get("success", True)).lower()
-            TOOL_CALLS_TOTAL.labels(tool_name=tool_name, success=success).inc()
+            TOOL_CALLS_TOTAL.labels(tool_name=tool_name, success="true").inc()
+
+        elif ctx.hook_name == HookName.POST_TOOL_EXEC_FAILURE:
+            tool_name = ctx.data.get("tool_name", "unknown")
+            TOOL_CALLS_TOTAL.labels(tool_name=tool_name, success="false").inc()
 
     except ImportError:
         pass
 
+    return ctx
+
+
+async def _tool_error_hook(ctx: HookContext) -> HookContext:
+    """POST_TOOL_EXEC_FAILURE: 记录工具调用失败详情。"""
+    logger.warning(
+        "tool_call_failed",
+        tool_name=ctx.data.get("tool_name", "unknown"),
+        tool_call_id=ctx.data.get("tool_call_id", ""),
+        error_message=ctx.data.get("error_message", "")[:200],
+        session_key=ctx.session_key,
+        task_id=ctx.task_id,
+    )
     return ctx
 
 
@@ -96,18 +112,59 @@ async def _context_overflow_hook(ctx: HookContext) -> HookContext:
     """上下文溢出时记录警告并提供压缩建议。"""
     original_count = ctx.data.get("original_messages", 0)
     remaining_count = ctx.data.get("remaining_messages", 0)
-    tokens = ctx.data.get("total_tokens", 0)
+    pre_tokens = ctx.data.get("pre_trim_total_tokens", ctx.data.get("total_tokens", 0))
+    post_tokens = ctx.data.get("post_trim_total_tokens", ctx.data.get("total_tokens", 0))
     budget = ctx.data.get("budget_tokens", 0)
 
     logger.warning(
         "context_overflow_handled",
         original_messages=original_count,
         remaining_messages=remaining_count,
-        tokens=tokens,
+        pre_trim_total_tokens=pre_tokens,
+        post_trim_total_tokens=post_tokens,
         budget=budget,
         session_key=ctx.session_key,
     )
 
+    return ctx
+
+
+async def _abort_hook(ctx: HookContext) -> HookContext:
+    """ON_RUN_ABORT: 记录任务中止信息。"""
+    logger.warning(
+        "run_aborted",
+        reason=ctx.data.get("reason", "unknown"),
+        iterations=ctx.data.get("iterations", 0),
+        duration_ms=ctx.data.get("duration_ms", 0),
+        session_key=ctx.session_key,
+        task_id=ctx.task_id,
+    )
+    return ctx
+
+
+async def _pre_context_trim_hook(ctx: HookContext) -> HookContext:
+    """PRE_CONTEXT_TRIM: 上下文裁剪前记录并可修改策略。"""
+    logger.info(
+        "context_trim_starting",
+        current_tokens=ctx.data.get("current_tokens", ctx.data.get("total_tokens", 0)),
+        budget_tokens=ctx.data.get("budget_tokens", 0),
+        message_count=ctx.data.get("message_count", 0),
+        session_key=ctx.session_key,
+    )
+    return ctx
+
+
+async def _session_end_hook(ctx: HookContext) -> HookContext:
+    """ON_SESSION_END: 记录会话级统计，用于资源清理。"""
+    logger.info(
+        "session_end",
+        total_input_tokens=ctx.data.get("total_input_tokens", 0),
+        total_output_tokens=ctx.data.get("total_output_tokens", 0),
+        iterations=ctx.data.get("iterations", 0),
+        duration_ms=ctx.data.get("duration_ms", 0),
+        session_key=ctx.session_key,
+        task_id=ctx.task_id,
+    )
     return ctx
 
 
@@ -144,6 +201,18 @@ def register_builtin_hooks(runner: HookRunner) -> None:
         priority=20,
         source="builtin.metrics",
     ))
+    runner.register(HookRegistration(
+        name=HookName.POST_TOOL_EXEC_FAILURE,
+        callback=_metrics_hook,
+        priority=20,
+        source="builtin.metrics",
+    ))
+    runner.register(HookRegistration(
+        name=HookName.POST_TOOL_EXEC_FAILURE,
+        callback=_tool_error_hook,
+        priority=10,
+        source="builtin.logging",
+    ))
 
     runner.register(HookRegistration(
         name=HookName.PRE_TOOL_EXEC,
@@ -153,8 +222,34 @@ def register_builtin_hooks(runner: HookRunner) -> None:
     ))
 
     runner.register(HookRegistration(
-        name=HookName.ON_CONTEXT_OVERFLOW,
+        name=HookName.POST_CONTEXT_TRIM,
         callback=_context_overflow_hook,
         priority=50,
         source="builtin.context",
+    ))
+
+    # ── 新增 hooks ────────────────────────────────────
+    runner.register(HookRegistration(
+        name=HookName.ON_RUN_ABORT,
+        callback=_abort_hook,
+        priority=10,
+        source="builtin.logging",
+    ))
+    runner.register(HookRegistration(
+        name=HookName.PRE_CONTEXT_TRIM,
+        callback=_pre_context_trim_hook,
+        priority=50,
+        source="builtin.context",
+    ))
+    runner.register(HookRegistration(
+        name=HookName.ON_SESSION_START,
+        callback=_logging_hook,
+        priority=10,
+        source="builtin.logging",
+    ))
+    runner.register(HookRegistration(
+        name=HookName.ON_SESSION_END,
+        callback=_session_end_hook,
+        priority=10,
+        source="builtin.logging",
     ))

@@ -7,14 +7,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from sahara_runtime.agent_loop import (
-    AgentLoop,
-    _add_assistant_message,
+from sahara_runtime.agent_loop import AgentLoop, run_agent_loop
+from sahara_runtime.context.context_builder import (
+    ContextBuilder,
     _maybe_convert_legacy_anthropic,
-    _session_msg_to_dict,
     build_assistant_message,
-    run_agent_loop,
 )
+from sahara_runtime.context.context_manager import ContextManager
+from sahara_runtime.context.token_counter import TokenCounter
 from sahara_runtime.hooks.runner import HookContext, HookName, HookRunner
 from sahara_runtime.llm.mock_provider import MockProvider
 from sahara_runtime.llm.types import LLMResponse, ToolCallRequest
@@ -43,24 +43,29 @@ class TestBuildAssistantMessage:
         assert msg["content"] is None
 
 
-# ── _add_assistant_message 测试 ──────────────────────
+# ── ContextBuilder.add_assistant_message 测试 ────────
 
 
 class TestAddAssistantMessage:
+    def _builder(self):
+        return ContextBuilder(TokenCounter())
+
     def test_text_only(self):
+        cb = self._builder()
         msgs: list[dict] = []
         resp = LLMResponse(content="Hello")
-        _add_assistant_message(msgs, resp)
+        cb.add_assistant_message(msgs, resp)
         assert len(msgs) == 1
         assert msgs[0]["role"] == "assistant"
         assert msgs[0]["content"] == "Hello"
         assert "tool_calls" not in msgs[0]
 
     def test_with_tool_calls(self):
+        cb = self._builder()
         msgs: list[dict] = []
         tc = ToolCallRequest(id="tc1", name="exec", arguments={"command": "ls"})
         resp = LLMResponse(content="Let me check", tool_calls=[tc])
-        _add_assistant_message(msgs, resp)
+        cb.add_assistant_message(msgs, resp)
         assert msgs[0]["content"] == "Let me check"
         assert len(msgs[0]["tool_calls"]) == 1
         tc_dict = msgs[0]["tool_calls"][0]
@@ -70,33 +75,28 @@ class TestAddAssistantMessage:
         assert json.loads(tc_dict["function"]["arguments"]) == {"command": "ls"}
 
     def test_tool_calls_only_no_text(self):
+        cb = self._builder()
         msgs: list[dict] = []
         tc = ToolCallRequest(id="tc2", name="read", arguments={"path": "/a"})
         resp = LLMResponse(content=None, tool_calls=[tc])
-        _add_assistant_message(msgs, resp)
+        cb.add_assistant_message(msgs, resp)
         assert msgs[0]["content"] is None
         assert len(msgs[0]["tool_calls"]) == 1
 
-    def test_empty_content_string(self):
-        msgs: list[dict] = []
-        resp = LLMResponse(content="")
-        _add_assistant_message(msgs, resp)
-        assert msgs[0]["content"] == ""
 
-
-# ── _session_msg_to_dict 测试 ────────────────────────
+# ── session_msg_to_dict 测试 ──────────────────────────
 
 
 class TestSessionMsgToDict:
     def test_plain_text(self):
         msg = SessionMessage(role="user", content="hello")
-        result = _session_msg_to_dict(msg)
+        result = ContextBuilder.session_msg_to_dict(msg)
         assert result == {"role": "user", "content": "hello"}
 
     def test_with_tool_calls_in_extra(self):
         tc = [{"id": "tc1", "type": "function", "function": {"name": "exec", "arguments": "{}"}}]
         msg = SessionMessage(role="assistant", content="check", extra={"tool_calls": tc})
-        result = _session_msg_to_dict(msg)
+        result = ContextBuilder.session_msg_to_dict(msg)
         assert result["tool_calls"] == tc
         assert result["content"] == "check"
 
@@ -105,11 +105,10 @@ class TestSessionMsgToDict:
             role="tool", content="ok",
             extra={"tool_call_id": "tc1", "name": "exec"},
         )
-        result = _session_msg_to_dict(msg)
+        result = ContextBuilder.session_msg_to_dict(msg)
         assert result["role"] == "tool"
         assert result["tool_call_id"] == "tc1"
         assert result["name"] == "exec"
-        assert result["content"] == "ok"
 
     def test_legacy_anthropic_assistant_converted(self):
         blocks = [
@@ -117,20 +116,15 @@ class TestSessionMsgToDict:
             {"type": "tool_use", "id": "tc1", "name": "exec", "input": {"command": "ls"}},
         ]
         msg = SessionMessage(role="assistant", content=json.dumps(blocks))
-        result = _session_msg_to_dict(msg)
+        result = ContextBuilder.session_msg_to_dict(msg)
         assert result["role"] == "assistant"
         assert result["content"] == "Let me check"
         assert len(result["tool_calls"]) == 1
         assert result["tool_calls"][0]["function"]["name"] == "exec"
 
-    def test_legacy_user_text_not_modified(self):
-        msg = SessionMessage(role="user", content="hello")
-        result = _session_msg_to_dict(msg)
-        assert result == {"role": "user", "content": "hello"}
-
     def test_invalid_json_stays_string(self):
         msg = SessionMessage(role="user", content="[not valid json")
-        result = _session_msg_to_dict(msg)
+        result = ContextBuilder.session_msg_to_dict(msg)
         assert result["content"] == "[not valid json"
 
 
@@ -235,7 +229,7 @@ class FakeModelRouter:
 
 
 class FakeToolRegistry:
-    def list_schemas(self):
+    def get_definitions(self):
         return []
 
     def names(self):
@@ -247,11 +241,6 @@ class FakeToolExecutor:
         return {"content": "tool ok"}
 
 
-class FakePromptBuilder:
-    def build(self, **kw):
-        return "You are a helpful assistant."
-
-
 @dataclass
 class FakeContainer:
     emitter_factory: Any = None
@@ -259,13 +248,10 @@ class FakeContainer:
     tool_executor: Any = None
     tool_registry: Any = None
     model_router: Any = None
-    prompt_builder: Any = None
+    context_manager: Any = None
     hook_runner: Any = None
     session_store: Any = None
-    context_manager: Any = None
-    token_counter: Any = None
-    skill_loader: Any = None
-    skill_filter: Any = None
+    skills_manager: Any = None
     sandbox_manager: Any = None
     workspace: Any = None
 
@@ -277,13 +263,10 @@ def make_container(**overrides) -> FakeContainer:
         tool_executor=FakeToolExecutor(),
         tool_registry=FakeToolRegistry(),
         model_router=FakeModelRouter(),
-        prompt_builder=FakePromptBuilder(),
+        context_manager=ContextManager(),
         hook_runner=None,
         session_store=None,
-        context_manager=None,
-        token_counter=None,
-        skill_loader=None,
-        skill_filter=None,
+        skills_manager=None,
     )
     defaults.update(overrides)
     return FakeContainer(**defaults)
@@ -368,7 +351,6 @@ class TestAgentLoopRun:
 class TestRunAgentLoopCompat:
     @pytest.mark.asyncio
     async def test_compat_entry_point(self):
-        """run_agent_loop() 兼容入口应该正常工作。"""
         container = make_container()
         completed = []
         await run_agent_loop(

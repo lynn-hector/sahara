@@ -1,8 +1,9 @@
 """AgentLoop — 驱动 LLM 交互循环的核心类。
 
-参考 nanobot/agent/loop.py 设计，将原有的过程式函数重构为类封装：
+参考 nanobot/agent/loop.py 设计:
 - 所有循环状态作为实例属性
 - LLM 调用通过 LLMProvider 抽象层
+- 消息编排和上下文管理通过 ContextManager 统一处理
 - Hook 系统在关键节点被调用
 - Session 持久化保存完整消息（含 tool_calls）
 """
@@ -18,10 +19,11 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from sahara_runtime.hooks.runner import HookContext, HookName
-from sahara_runtime.llm.types import LLMResponse, ToolCallRequest
+from sahara_runtime.llm.types import ToolCallRequest
 from sahara_runtime.memory.session_store import SessionMessage
 
 if TYPE_CHECKING:
+    from sahara_runtime.context.context_manager import ContextManager
     from sahara_runtime.di.container import Container
     from sahara_runtime.events.emitter import RunEmitter
     from sahara_runtime.grpc.agent_servicer import TaskHandle
@@ -75,11 +77,7 @@ def _metrics_llm_tokens(
 
 
 class AgentLoop:
-    """Agent 核心交互循环。
-
-    每个 SubmitTask 调用创建一个 AgentLoop 实例并执行 run()。
-    参考 nanobot 的 AgentLoop 设计，将循环状态封装为实例属性。
-    """
+    """Agent 核心交互循环。"""
 
     def __init__(
         self,
@@ -112,6 +110,7 @@ class AgentLoop:
         self._tool_executor: ToolExecutor = container.tool_executor
         self._hook_runner: HookRunner | None = container.hook_runner
         self._session_store: SessionStore | None = container.session_store
+        self._ctx: ContextManager = container.context_manager
 
         self._start_time = 0.0
         self._iteration = 0
@@ -122,6 +121,11 @@ class AgentLoop:
         """执行完整的 Agent Loop 生命周期。"""
         self._start_time = time.time()
         _metrics_task_start(self.agent_id)
+
+        await self._fire_hook(
+            HookName.ON_SESSION_START,
+            agent_id=self.agent_id,
+        )
 
         try:
             async with asyncio.timeout(TASK_TIMEOUT):
@@ -149,6 +153,12 @@ class AgentLoop:
             _metrics_task_end(self.agent_id, "cancelled", self._start_time)
             logger.info("task_cancelled", task_id=self.task_id, run_id=self.run_id)
             await self._emitter.emit_abort("task cancelled by user", aborted_by="user")
+            await self._fire_hook(
+                HookName.ON_RUN_ABORT,
+                reason="cancelled_by_user",
+                iterations=self._iteration,
+                duration_ms=int((time.time() - self._start_time) * 1000),
+            )
 
         except Exception:
             _metrics_task_end(self.agent_id, "error", self._start_time)
@@ -157,32 +167,62 @@ class AgentLoop:
             await self._fire_hook(HookName.ON_RUN_ERROR, error="internal_error")
 
         finally:
+            await self._fire_hook(
+                HookName.ON_SESSION_END,
+                total_input_tokens=self._total_input_tokens,
+                total_output_tokens=self._total_output_tokens,
+                iterations=self._iteration,
+                duration_ms=int((time.time() - self._start_time) * 1000),
+            )
             if self._on_complete:
                 self._on_complete(self.task_id)
 
     async def _run_loop(self, model_config: Any) -> None:
         """核心 ReAct 循环：LLM 调用 -> 工具执行 -> 再次调用，直到无工具调用或达到上限。"""
-        tool_schemas = self._container.tool_registry.list_schemas()
+        history = await self._load_history()
+        tool_schemas = self._container.tool_registry.get_definitions()
 
-        skills_prompt = await self._build_skills_prompt()
-        ws = self._container.workspace
-        system_prompt = self._container.prompt_builder.build(
+        system_prompt, messages = await self._ctx.build_run_context(
             session_key=self.session_key,
             model=model_config.model_id,
             max_iterations=model_config.max_iterations,
             tools=tool_schemas or None,
-            skills_prompt=skills_prompt,
-            workspace_path=str(ws) if ws else "",
+            history=history,
+            user_message=self.user_message,
         )
 
-        history = await self._load_history()
-        messages: list[dict[str, Any]] = history + [
-            {"role": "user", "content": self.user_message},
-        ]
-
-        messages = self._fit_context(messages, model_config, system_prompt)
+        ctx_stats = self._ctx.get_context_stats(
+            messages=messages,
+            max_context_tokens=model_config.max_context_tokens,
+            system_prompt=system_prompt,
+        )
+        if ctx_stats["needs_trim"]:
+            await self._fire_hook(
+                HookName.PRE_CONTEXT_TRIM,
+                current_tokens=ctx_stats["input_tokens"],
+                total_tokens=ctx_stats["input_tokens"],
+                budget_tokens=model_config.max_context_tokens,
+                message_count=ctx_stats["original_count"],
+            )
+        fit = self._ctx.fit_context_with_stats(
+            messages=messages,
+            max_context_tokens=model_config.max_context_tokens,
+            system_prompt=system_prompt,
+        )
+        if fit["trimmed"]:
+            await self._fire_hook(
+                HookName.POST_CONTEXT_TRIM,
+                original_messages=fit["original_count"],
+                remaining_messages=fit["remaining_count"],
+                pre_trim_total_tokens=fit["pre_trim_total_tokens"],
+                post_trim_total_tokens=fit["post_trim_total_tokens"],
+                total_tokens=fit["post_trim_total_tokens"],
+                budget_tokens=model_config.max_context_tokens,
+            )
+        messages = fit["messages"]
 
         final_text = ""
+        response = None
 
         for self._iteration in range(1, model_config.max_iterations + 1):
             await self._fire_hook(
@@ -227,15 +267,23 @@ class AgentLoop:
 
             if not response.has_tool_calls:
                 final_text = response.content or ""
-                messages = _add_assistant_message(messages, response)
+                messages = self._ctx.add_assistant_message(messages, response)
                 break
 
-            messages = _add_assistant_message(messages, response)
+            messages = self._ctx.add_assistant_message(messages, response)
             messages = await self._execute_tool_calls(
                 response.tool_calls, messages,
             )
         else:
             final_text = (response.content if response else None) or "[max iterations reached]"
+
+        pre_resp_ctx = await self._fire_hook(
+            HookName.PRE_RESPONSE,
+            final_text=final_text,
+            iterations=self._iteration,
+        )
+        if pre_resp_ctx and pre_resp_ctx.data.get("final_text"):
+            final_text = pre_resp_ctx.data["final_text"]
 
         duration_ms = int((time.time() - self._start_time) * 1000)
         await self._emitter.emit_run_complete(
@@ -258,7 +306,7 @@ class AgentLoop:
         tool_calls: list[ToolCallRequest],
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """执行一轮工具调用，以 OpenAI role:"tool" 消息追加结果。"""
+        """执行一轮工具调用，追加 tool result 消息。"""
         for tc in tool_calls:
             await self._fire_hook(
                 HookName.PRE_TOOL_EXEC,
@@ -270,12 +318,10 @@ class AgentLoop:
             if self._task_handle and tc.name in CONFIRM_REQUIRED_TOOLS:
                 confirmed = await self._wait_for_tool_confirmation(tc)
                 if not confirmed:
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "name": tc.name,
-                        "content": "User rejected this tool execution.",
-                    })
+                    messages = self._ctx.add_tool_result(
+                        messages, tc.id, tc.name,
+                        "User rejected this tool execution.",
+                    )
                     continue
 
             try:
@@ -294,19 +340,25 @@ class AgentLoop:
             if result is None:
                 result = {"content": "", "is_error": True}
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "name": tc.name,
-                "content": result.get("content", ""),
-            })
-
-            await self._fire_hook(
-                HookName.POST_TOOL_EXEC,
-                tool_name=tc.name,
-                tool_call_id=tc.id,
-                success=not result.get("is_error", False),
+            messages = self._ctx.add_tool_result(
+                messages, tc.id, tc.name, result.get("content", ""),
             )
+
+            is_error = result.get("is_error", False)
+            if is_error:
+                await self._fire_hook(
+                    HookName.POST_TOOL_EXEC_FAILURE,
+                    tool_name=tc.name,
+                    tool_call_id=tc.id,
+                    error_message=result.get("content", ""),
+                    arguments=tc.arguments,
+                )
+            else:
+                await self._fire_hook(
+                    HookName.POST_TOOL_EXEC,
+                    tool_name=tc.name,
+                    tool_call_id=tc.id,
+                )
 
         return messages
 
@@ -314,12 +366,9 @@ class AgentLoop:
         """暂停 agent 等待用户确认高危工具执行。"""
         from sahara.common.v1 import common_pb2
 
-        from sahara_runtime.grpc.agent_servicer import UserInput
-
         task_handle = self._task_handle
         if task_handle is None:
             return True
-
 
         if task_handle.input_channel is None:
             task_handle.input_channel = asyncio.Queue(maxsize=1)
@@ -327,11 +376,12 @@ class AgentLoop:
         task_handle.waiting_for_input = True
         task_handle.state = common_pb2.TASK_STATE_WAITING_FOR_INPUT
 
+        from sahara_runtime.grpc.agent_servicer import UserInput
+
         await self._emitter.emit_tool_confirm_required(
             tool_call_id=tc.id,
             tool_name=tc.name,
-            input_json=json.dumps(tc.arguments),
-            risk_description=f"Tool '{tc.name}' requires confirmation before execution.",
+            input_json=json.dumps(tc.arguments, ensure_ascii=False),
             timeout_seconds=INPUT_WAIT_TIMEOUT,
         )
 
@@ -355,45 +405,13 @@ class AgentLoop:
             task_handle.waiting_for_input = False
             task_handle.state = common_pb2.TASK_STATE_RUNNING
 
-    async def _build_skills_prompt(self) -> str:
-        """加载并过滤 Skills，构建 prompt 片段。"""
-        if not self._container.skill_loader or not self._container.skill_filter:
-            return ""
-        try:
-            from sahara_runtime.skills.prompt import build_skills_prompt
-            all_skills = await self._container.skill_loader.load_all()
-            active_skills = self._container.skill_filter.filter(all_skills)
-            return build_skills_prompt(active_skills)
-        except Exception:
-            logger.warning("skills_prompt_build_failed", exc_info=True)
-            return ""
-
-    def _fit_context(
-        self,
-        messages: list[dict[str, Any]],
-        model_config: Any,
-        system_prompt: str,
-    ) -> list[dict[str, Any]]:
-        """使用 ContextManager 裁剪消息以适配上下文窗口。"""
-        ctx_mgr = self._container.context_manager
-        tk_counter = self._container.token_counter
-        if not ctx_mgr or not tk_counter:
-            return messages
-
-        system_tokens = tk_counter.count_system(system_prompt)
-        return ctx_mgr.fit_messages(
-            messages,
-            max_context_tokens=model_config.max_context_tokens,
-            system_tokens=system_tokens,
-        )
-
     async def _load_history(self) -> list[dict[str, Any]]:
         """从 SessionStore 加载历史消息。"""
         if self._session_store is None:
             return []
         try:
             stored = await self._session_store.load(self.session_key)
-            return [_session_msg_to_dict(msg) for msg in stored]
+            return [self._ctx.session_msg_to_dict(msg) for msg in stored]
         except Exception:
             logger.warning("session_load_failed", session_key=self.session_key, exc_info=True)
             return []
@@ -403,10 +421,7 @@ class AgentLoop:
         messages: list[dict[str, Any]],
         original_history: list[dict[str, Any]],
     ) -> None:
-        """将本轮新增的消息持久化到 SessionStore。
-
-        OpenAI 格式消息的额外字段 (tool_calls, tool_call_id, name) 存入 extra。
-        """
+        """将本轮新增的消息持久化到 SessionStore。"""
         if self._session_store is None:
             return
 
@@ -465,115 +480,6 @@ class AgentLoop:
         except Exception:
             logger.warning("hook_fire_failed", hook=hook_name.value, exc_info=True)
             return ctx
-
-
-def build_assistant_message(
-    content: str | None,
-    tool_calls: list[dict[str, Any]] | None = None,
-    thinking: str | None = None,
-    reasoning_content: str | None = None,
-) -> dict[str, Any]:
-    """构建 OpenAI 格式的 assistant message。
-
-    参考 nanobot/utils/helpers.py build_assistant_message。
-    """
-    msg: dict[str, Any] = {"role": "assistant", "content": content}
-    if tool_calls:
-        msg["tool_calls"] = tool_calls
-    if thinking is not None:
-        msg["thinking"] = thinking
-    if reasoning_content is not None:
-        msg["reasoning_content"] = reasoning_content
-    return msg
-
-
-def _add_assistant_message(
-    messages: list[dict[str, Any]],
-    response: LLMResponse,
-) -> list[dict[str, Any]]:
-    """将 LLMResponse 转换为 OpenAI 通用格式的 assistant message 并追加到 messages。"""
-    tool_call_dicts = [tc.to_openai_tool_call() for tc in response.tool_calls] or None
-    messages.append(build_assistant_message(
-        response.content,
-        tool_calls=tool_call_dicts,
-        thinking=response.thinking,
-        reasoning_content=response.reasoning_content,
-    ))
-    return messages
-
-
-def _session_msg_to_dict(msg: SessionMessage) -> dict[str, Any]:
-    """将 SessionMessage 转换为 OpenAI 通用格式的 LLM message dict。
-
-    如果 extra 中有 tool_calls / tool_call_id 等字段则还原到顶层。
-    同时兼容旧的 Anthropic 格式数据（content 为 JSON content blocks）。
-    """
-    result: dict[str, Any] = {"role": msg.role, "content": msg.content}
-
-    extra = msg.extra or {}
-    if extra.get("tool_calls"):
-        result["tool_calls"] = extra["tool_calls"]
-    if extra.get("tool_call_id"):
-        result["tool_call_id"] = extra["tool_call_id"]
-    if extra.get("name"):
-        result["name"] = extra["name"]
-    if extra.get("thinking"):
-        result["thinking"] = extra["thinking"]
-    if extra.get("reasoning_content"):
-        result["reasoning_content"] = extra["reasoning_content"]
-
-    if not extra:
-        result = _maybe_convert_legacy_anthropic(result)
-
-    return result
-
-
-def _maybe_convert_legacy_anthropic(msg: dict[str, Any]) -> dict[str, Any]:
-    """兼容旧 Anthropic 格式: 将 content blocks 转换为 OpenAI 格式。
-
-    旧格式 assistant: {"content": [{"type":"text",...}, {"type":"tool_use",...}]}
-    旧格式 user:      {"content": [{"type":"tool_result","tool_use_id":...}]}
-    """
-    content = msg.get("content")
-    if isinstance(content, str):
-        try:
-            content = json.loads(content)
-        except (json.JSONDecodeError, ValueError):
-            return msg
-        if not isinstance(content, list):
-            return msg
-
-    if not isinstance(content, list):
-        return msg
-
-    if msg.get("role") == "assistant":
-        text_parts: list[str] = []
-        tool_calls: list[dict[str, Any]] = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-            elif block.get("type") == "tool_use":
-                tool_calls.append({
-                    "id": block.get("id", ""),
-                    "type": "function",
-                    "function": {
-                        "name": block.get("name", ""),
-                        "arguments": json.dumps(
-                            block.get("input", {}), ensure_ascii=False,
-                        ),
-                    },
-                })
-        result: dict[str, Any] = {
-            "role": "assistant",
-            "content": "".join(text_parts) or None,
-        }
-        if tool_calls:
-            result["tool_calls"] = tool_calls
-        return result
-
-    return msg
 
 
 async def run_agent_loop(

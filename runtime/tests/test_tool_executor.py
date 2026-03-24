@@ -1,17 +1,17 @@
-"""ToolExecutor 单元测试。"""
+"""ToolExecutor + ToolRegistry 单元测试。"""
 
 import asyncio
 import json
+from typing import Any
 
 import pytest
 
+from sahara_runtime.tools.base import Tool
 from sahara_runtime.tools.executor import ToolExecutor
-from sahara_runtime.tools.registry import ToolDef, ToolRegistry
+from sahara_runtime.tools.registry import ToolRegistry
 
 
 class FakeEmitter:
-    """Mock RunEmitter for tests."""
-
     def __init__(self):
         self.events = []
 
@@ -22,40 +22,68 @@ class FakeEmitter:
         self.events.append(("tool_result", tool_call_id, tool_name, success, output[:100]))
 
 
-async def echo_tool(text: str) -> str:
-    return f"echo: {text}"
+class EchoTool(Tool):
+    @property
+    def name(self) -> str:
+        return "echo"
+
+    @property
+    def description(self) -> str:
+        return "echo tool"
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        }
+
+    async def execute(self, text: str, **kw: Any) -> str:
+        return f"echo: {text}"
 
 
-async def slow_tool(seconds: int = 10) -> str:
-    await asyncio.sleep(seconds)
-    return "done"
+class SlowTool(Tool):
+    @property
+    def name(self) -> str:
+        return "slow"
+
+    @property
+    def description(self) -> str:
+        return "slow tool"
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {"seconds": {"type": "integer"}}}
+
+    async def execute(self, seconds: int = 10, **kw: Any) -> str:
+        await asyncio.sleep(seconds)
+        return "done"
 
 
-async def failing_tool() -> str:
-    raise RuntimeError("tool exploded")
+class FailTool(Tool):
+    @property
+    def name(self) -> str:
+        return "fail"
+
+    @property
+    def description(self) -> str:
+        return "failing tool"
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object"}
+
+    async def execute(self, **kw: Any) -> str:
+        raise RuntimeError("tool exploded")
 
 
 @pytest.fixture
 def registry():
     reg = ToolRegistry()
-    reg.register(ToolDef(
-        name="echo",
-        description="echo tool",
-        input_schema={"type": "object", "properties": {"text": {"type": "string"}}},
-        func=echo_tool,
-    ))
-    reg.register(ToolDef(
-        name="slow",
-        description="slow tool",
-        input_schema={"type": "object", "properties": {"seconds": {"type": "integer"}}},
-        func=slow_tool,
-    ))
-    reg.register(ToolDef(
-        name="fail",
-        description="failing tool",
-        input_schema={"type": "object"},
-        func=failing_tool,
-    ))
+    reg.register(EchoTool())
+    reg.register(SlowTool())
+    reg.register(FailTool())
     return reg
 
 
@@ -78,7 +106,7 @@ class TestToolExecutor:
         assert "is_error" not in result
         assert len(emitter.events) == 2
         assert emitter.events[0][0] == "tool_start"
-        assert emitter.events[1][3] is True  # success=True
+        assert emitter.events[1][3] is True
 
     @pytest.mark.asyncio
     async def test_unknown_tool(self, executor):
@@ -90,7 +118,7 @@ class TestToolExecutor:
             emitter=emitter,
         )
         assert result["is_error"]
-        assert "unknown tool" in result["content"]
+        assert "not found" in result["content"].lower()
 
     @pytest.mark.asyncio
     async def test_invalid_json(self, executor):
@@ -120,7 +148,7 @@ class TestToolExecutor:
     async def test_tool_timeout(self, executor):
         import sahara_runtime.tools.executor as mod
         original = mod.TOOL_TIMEOUT
-        mod.TOOL_TIMEOUT = 0.1  # 100ms
+        mod.TOOL_TIMEOUT = 0.1
         try:
             emitter = FakeEmitter()
             result = await executor.execute(
@@ -138,30 +166,44 @@ class TestToolExecutor:
 class TestToolRegistry:
     def test_register_and_get(self):
         reg = ToolRegistry()
-        td = ToolDef(name="test", description="d", input_schema={}, func=echo_tool)
-        reg.register(td)
-        assert reg.get("test") is td
+        tool = EchoTool()
+        reg.register(tool)
+        assert reg.get("echo") is tool
         assert reg.get("nope") is None
 
-    def test_list_schemas(self):
+    def test_get_definitions(self):
         reg = ToolRegistry()
-        reg.register(ToolDef(name="b", description="B", input_schema={"b": 1}, func=echo_tool, tier=1))
-        reg.register(ToolDef(name="a", description="A", input_schema={"a": 1}, func=echo_tool, tier=0))
-        schemas = reg.list_schemas()
-        assert len(schemas) == 2
+        reg.register(EchoTool())
+        schemas = reg.get_definitions()
+        assert len(schemas) == 1
         assert schemas[0]["type"] == "function"
-        assert schemas[0]["function"]["name"] == "a"  # tier 0 first
-        assert schemas[0]["function"]["parameters"] == {"a": 1}
-        assert schemas[1]["function"]["name"] == "b"
-        assert schemas[1]["function"]["parameters"] == {"b": 1}
+        assert schemas[0]["function"]["name"] == "echo"
+        assert "text" in schemas[0]["function"]["parameters"]["properties"]
 
     def test_names(self):
         reg = ToolRegistry()
-        reg.register(ToolDef(name="x", description="X", input_schema={}, func=echo_tool))
-        assert reg.names() == ["x"]
+        reg.register(EchoTool())
+        assert reg.names() == ["echo"]
 
-    def test_sandboxed_flag(self):
+    @pytest.mark.asyncio
+    async def test_execute_success(self):
         reg = ToolRegistry()
-        td = ToolDef(name="sb", description="d", input_schema={}, func=echo_tool, sandboxed=True)
-        reg.register(td)
-        assert reg.get("sb").sandboxed is True
+        reg.register(EchoTool())
+        result = await reg.execute("echo", {"text": "hi"})
+        assert result["content"] == "echo: hi"
+        assert "is_error" not in result
+
+    @pytest.mark.asyncio
+    async def test_execute_not_found(self):
+        reg = ToolRegistry()
+        result = await reg.execute("nope", {})
+        assert result["is_error"]
+        assert "not found" in result["content"].lower()
+
+    @pytest.mark.asyncio
+    async def test_execute_validation_error(self):
+        reg = ToolRegistry()
+        reg.register(EchoTool())
+        result = await reg.execute("echo", {})
+        assert result["is_error"]
+        assert "missing required" in result["content"].lower()
